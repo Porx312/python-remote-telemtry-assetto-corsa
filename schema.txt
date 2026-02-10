@@ -1,0 +1,21 @@
+('id', 'int(11)', 'NO', 'PRI', None, 'auto_increment')
+('steam_id', 'varchar(50)', 'YES', 'MUL', None, '')
+('car_model', 'varchar(100)', 'YES', '', None, '')
+('track', 'varchar(100)', 'YES', '', None, '')
+('server_name', 'varchar(100)', 'YES', '', None, '')
+('lap_time', 'int(11)', 'NO', '', None, '')
+('date', 'timestamp', 'NO', '', 'current_timestamp()', '')
+('valid_lap', 'tinyint(1)', 'YES', '', '1', '')
+('timestamp', 'bigint(20)', 'YES', '', '0', '')
+
+INDEXES:
+('lap_records', 0, 'PRIMARY', 1, 'id', 'A', 5, None, None, '', 'BTREE', '', '')
+('lap_records', 0, 'unique_lap', 1, 'steam_id', 'A', 5, None, None, 'YES', 'BTREE', '', '')
+('lap_records', 0, 'unique_lap', 2, 'car_model', 'A', 5, None, None, 'YES', 'BTREE', '', '')
+('lap_records', 0, 'unique_lap', 3, 'track', 'A', 5, None, None, 'YES', 'BTREE', '', '')
+
+DRIVERS:
+('steam_id', 'varchar(50)', 'NO', 'PRI', None, '')
+('name', 'varchar(100)', 'NO', '', None, '')
+('created_at', 'timestamp', 'NO', '', 'current_timestamp()', '')
+('updated_at', 'timestamp', 'NO', '', 'current_timestamp()', 'on update current_timestamp()')
