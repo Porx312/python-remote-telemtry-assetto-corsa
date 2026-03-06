@@ -14,7 +14,7 @@ class ACSP:
     NEW_SESSION = 50
     NEW_CONNECTION = 51
     CONNECTION_CLOSED = 52
-    CAR_UPDATE = 53           # Realtime position
+    CAR_UPDATE = 53           # Realtime car position/speed (subscribe with packet 200)
     CAR_INFO = 54             # Car info response
     END_SESSION = 55
     VERSION = 56
@@ -60,63 +60,34 @@ class PacketParser:
         return len(self.data) - self.offset
 
     def read_string(self):
+        """Reads a std::string from AC server (1 byte length + ASCII/UTF-8 bytes)"""
         if self.offset >= len(self.data): return ""
-        
-        start_offset = self.offset
         length = self.read_uint8()
-        if length is None: return ""
+        if length is None or length == 0: return ""
 
-        # --- DETECCIÓN DE UTF-32 (Padded 4-bytes) ---
-        if self.offset + 3 <= len(self.data):
-            try:
-                val_bytes = self.data[self.offset-1 : self.offset+3]
-                val = struct.unpack('<I', val_bytes)[0]
-                
-                if (val & 0xFFFFFF00) == 0 and val != 0:
-                     self.offset -= 1
-                     res = ""
-                     while self.offset + 4 <= len(self.data):
-                         char_code = struct.unpack_from('<I', self.data, self.offset)[0]
-                         if char_code == 0:
-                             self.offset += 4
-                             break
-                         if (char_code & 0xFFFFFF00) != 0:
-                             break
-                        
-                         res += chr(char_code)
-                         self.offset += 4
-                     
-                     if len(res) > 0: return res.strip()
-                     else: self.offset = start_offset + 1
-            except:
-                self.offset = start_offset + 1
-
-        # Strategy B: Length prefix followed by UTF-32
-        if length > 0 and self.offset + (length * 4) <= len(self.data):
-             if self.data[self.offset + 1] == 0 and self.data[self.offset + 2] == 0 and self.data[self.offset + 3] == 0:
-                 chunk = self.data[self.offset : self.offset + (length * 4)]
-                 self.offset += length * 4
-                 try:
-                     return chunk.decode('utf-32le').split('\x00')[0]
-                 except: pass
-
-        if length == 0: return ""
-        
-        # --- DETECCIÓN DE UTF-16LE ---
-        if self.offset + (length * 2) <= len(self.data):
-            if self.data[self.offset + 1] == 0:
-                chunk = self.data[self.offset : self.offset + (length * 2)]
-                self.offset += length * 2
-                try:
-                     return chunk.decode('utf-16le').split('\x00')[0]
-                except: pass
-
-        # --- CASO POR DEFECTO: ASCII / UTF-8 ---
         if self.offset + length <= len(self.data):
             chunk = self.data[self.offset : self.offset + length]
             self.offset += length
             try:
-                return chunk.decode('utf-8', errors='ignore').split('\x00')[0]
+                return chunk.decode('utf-8', errors='replace').split('\x00')[0]
             except: pass
-            
         return ""
+
+    def read_wstring(self):
+        """Reads a std::wstring from AC server (1 byte length + UTF-32 bytes)"""
+        if self.offset >= len(self.data): return ""
+        length = self.read_uint8()
+        if length is None or length == 0: return ""
+
+        res = ""
+        for _ in range(length):
+            if self.offset + 4 <= len(self.data):
+                char_bytes = self.data[self.offset : self.offset + 4]
+                self.offset += 4
+                try:
+                    char = char_bytes.decode('utf-32le', errors='replace').replace('\x00', '')
+                    res += char
+                except: pass
+            else:
+                break
+        return res.strip()
