@@ -216,3 +216,71 @@ def save_touge_battle(server_name, track, track_config, p1_guid, p2_guid, winner
         print(f"💾 Touge Battle saved: Winner {winner_guid} | [{p1_score}-{p2_score}] on {track}")
     except Exception as e:
         print(f"❌ Error saving Touge Battle: {e}")
+
+def get_active_server_event(server_name, event_type=None):
+    """
+    Retorna la configuración del webhook activo para el server dado. Si event_type es
+    None, retorna cualquier evento activo del servidor (el más reciente).
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        if event_type:
+            query = """
+                SELECT webhook_url, event_type, metadata
+                FROM server_events
+                WHERE server_name = %s AND event_type = %s
+                ORDER BY id DESC LIMIT 1
+            """
+            cursor.execute(query, (server_name, event_type))
+        else:
+            query = """
+                SELECT webhook_url, event_type, metadata
+                FROM server_events
+                WHERE server_name = %s
+                ORDER BY id DESC LIMIT 1
+            """
+            cursor.execute(query, (server_name,))
+
+        row = cursor.fetchone()
+        if row:
+            import json
+            meta = row["metadata"] if row["metadata"] else {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except:
+                    meta = {}
+            return {
+                "webhook_url": row["webhook_url"],
+                "event_type":  row["event_type"],
+                "metadata":    meta
+            }
+    except Exception as e:
+        print(f"❌ Error getting active server event: {e}")
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+    return None
+
+def list_all_server_events():
+    """Retorna todos los registros de server_events para poder elegir el servidor correcto."""
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT id, server_name, event_type, webhook_url, created_at
+            FROM server_events
+            ORDER BY id DESC
+        """)
+        return cursor.fetchall()
+    except Exception as e:
+        print(f"❌ Error listing server events: {e}")
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+    return []
