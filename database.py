@@ -229,17 +229,17 @@ def get_active_server_event(server_name, event_type=None):
         cursor = conn.cursor(dictionary=True)
         if event_type:
             query = """
-                SELECT webhook_url, event_type, metadata
+                SELECT webhook_url, event_type, metadata, event_status
                 FROM server_events
-                WHERE server_name = %s AND event_type = %s
+                WHERE server_name = %s AND event_type = %s AND event_status = 'started'
                 ORDER BY id DESC LIMIT 1
             """
             cursor.execute(query, (server_name, event_type))
         else:
             query = """
-                SELECT webhook_url, event_type, metadata
+                SELECT webhook_url, event_type, metadata, event_status
                 FROM server_events
-                WHERE server_name = %s
+                WHERE server_name = %s AND event_status = 'started'
                 ORDER BY id DESC LIMIT 1
             """
             cursor.execute(query, (server_name,))

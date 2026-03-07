@@ -51,6 +51,16 @@ class DriverInfo:
         self.last_lap    = 0
         self.lap_count   = 0
         self.failed_laps = 0
+        
+        # Idle detection
+        self.last_pos         = None
+        self.last_pos_time    = 0
+        
+        # Restart constraint detection
+        self.lap_start_time   = 0
+        
+        # Real-time state tracking
+        self.lap_notified_fail= False
 
 
 class ServerState:
@@ -71,7 +81,70 @@ class ServerState:
 # PACKET PROCESSING
 # ──────────────────────────────────────────────
 
+def send_registration(server_state, server_ip):
+    """Envía la suscripción al servidor. Usamos el server_cmd_port (UDP_PLUGIN_LOCAL_PORT)."""
+    sock = server_state.sock
+    target = (server_ip, server_state.server_cmd_port)
+    print(f"✉️ Registering with {server_ip}:{server_state.server_cmd_port} <- listen on {server_state.port}...")
+
+    # Handshake
+    sock.sendto(struct.pack('B', 0), target)
+    # Subscribe Update (200) - interval=50ms tells server to send CAR_UPDATE (53) every 50ms
+    sock.sendto(struct.pack('<BH', 200, 50), target)
+    # Get Session Info (59)
+    sock.sendto(struct.pack('B', 59), target)
+
+    # Request Car Info for first 32 slots (staggered)
+    def _request():
+        for i in range(32):
+            packet = struct.pack('BB', 201, i)  # GET_CAR_INFO
+            sock.sendto(packet, target)
+            time.sleep(0.05)
+    
+    threading.Thread(target=_request, daemon=True).start()
+
+def send_chat(server_state, car_id, message):
+    """Envía un mensaje privado al chat del jugador en el servidor."""
+    if not server_state.last_server_addr: return
+    try:
+        sock = server_state.sock
+        target = (server_state.last_server_addr[0], server_state.server_cmd_port)
+        
+        # SEND_CHAT (202) formato: [byte id] [byte car_id] [byte len] [wstring mensaje]
+        msg_bytes = message.encode('utf-32le', errors='replace')
+        num_chars = len(msg_bytes) // 4
+        
+        # 202, car_id, length (in utf-32 chars)
+        header = struct.pack('BBB', 202, car_id, num_chars)
+        sock.sendto(header + msg_bytes, target)
+    except Exception as e:
+        print(f"❌ Error enviando chat a Car{car_id}: {e}")
+
+def send_admin_command(server_state, command_str):
+    """Envía un comando de administrador (ej: /pit <id>, /kick <id>) al servidor."""
+    if not server_state.last_server_addr: return
+    try:
+        sock = server_state.sock
+        target = (server_state.last_server_addr[0], server_state.server_cmd_port)
+        
+        # ACSP ADMIN_COMMAND (208) formato: [byte id] [byte len] [wstring command]
+        cmd_bytes = command_str.encode('utf-32le', errors='replace')
+        num_chars = len(cmd_bytes) // 4
+        
+        header = struct.pack('BB', getattr(ACSP, 'ADMIN_COMMAND', 208), num_chars)
+        sock.sendto(header + cmd_bytes, target)
+        print(f"🔨 [{server_state.port}] AdminCmd: {command_str}")
+    except Exception as e:
+        print(f"❌ Error enviando AdminCmd '{command_str}': {e}")
+
 def process_packet(data, server_state, addr):
+    # Auto-connect logic: register once per server startup/connection when we see traffic
+    server_ip = addr[0]
+    if server_state.last_server_addr is None:
+        print(f"🔌 Auto-Connected from server {server_state.server_name} @ {server_ip}")
+        server_state.last_server_addr = (server_ip, server_state.server_cmd_port)
+        send_registration(server_state, server_ip)
+
     server_state.last_server_addr = addr
     parser = PacketParser(data)
     packet_type = parser.read_uint8()
@@ -141,6 +214,9 @@ def process_packet(data, server_state, addr):
         print(f"🟢 [{server_state.port}] [CONNECTED] CarID {car_id} | {name} | {model} | {guid}")
         save_driver(guid, name, model)
 
+        driver.lap_start_time = time.time() * 1000
+        driver.lap_notified_fail = False
+
         # Notify: player is now active (isStillGoing=True)
         if not guid.startswith('unknown_'):
             dispatch_event(server_state, driver, lap_time_ms=0, is_finished=False)
@@ -183,6 +259,60 @@ def process_packet(data, server_state, addr):
                 del server_state.guid_to_driver[driver.guid]
             del server_state.active_drivers[car_id]
 
+    # ─── CAR_UPDATE (53) ────────────────────────────────────
+    elif packet_type == getattr(ACSP, 'CAR_UPDATE', 53):
+        car_id = parser.read_uint8()
+        if car_id is None: return
+        pos_x  = parser.read_float()
+        pos_y  = parser.read_float()
+        pos_z  = parser.read_float()
+        v_x    = parser.read_float()
+        v_y    = parser.read_float()
+        v_z    = parser.read_float()
+        gear   = parser.read_uint8()
+        rpm    = parser.read_uint16()
+        spline = parser.read_float()
+        
+        driver = server_state.active_drivers.get(car_id)
+        if driver:
+            speed_ms = ((v_x or 0)**2 + (v_y or 0)**2 + (v_z or 0)**2)**0.5
+            now = time.time() * 1000
+            if speed_ms < 0.5: # 0.5 m/s (~ 1.8 km/h) threshold for idle
+                if driver.last_pos_time == 0:
+                    driver.last_pos_time = now
+                elif (now - driver.last_pos_time) > 5000: # Over 5 seconds idle
+                    driver.was_idle = True
+                    event = get_active_server_event(server_state.server_name) or get_active_server_event(server_state.config_server_name)
+                    meta = event.get("metadata", {}) if event else {}
+                    # Only notify once per incident, and only test idle if they actually completed 1 lap (lap_count > 0, means starting 2nd lap or later depending on logic, let's just make it lap_count >= 1 so 1st completed lap)
+                    if meta.get("detectIdle", False) and driver.lap_count >= 1 and not getattr(driver, "idle_notified", False):
+                        driver.idle_notified = True
+                        driver.failed_laps = getattr(driver, 'failed_laps', 0) + 1
+                        driver.lap_notified_fail = True
+                        max_fails = meta.get("maxFails", "?")
+                        send_chat(server_state, car_id, f"[EVENT] Lap FAILED: Stopped on track (>5s) ({driver.failed_laps}/{max_fails} fails)")
+                        send_admin_command(server_state, f"/pit {car_id}")
+            else:
+                driver.last_pos_time = 0
+
+    # ─── CLIENT_EVENT (130) ─────────────────────────────────
+    elif packet_type == getattr(ACSP, 'CLIENT_EVENT', 130):
+        ev_type = parser.read_uint8()
+        car_id  = parser.read_uint8()
+        if ev_type in (getattr(ACSP, 'CE_COLLISION_WITH_CAR', 10), getattr(ACSP, 'CE_COLLISION_WITH_ENV', 11)):
+            driver = server_state.active_drivers.get(car_id)
+            if driver:
+                driver.had_collision = True
+                event = get_active_server_event(server_state.server_name) or get_active_server_event(server_state.config_server_name)
+                meta = event.get("metadata", {}) if event else {}
+                if meta.get("enableCollisions", False) and not getattr(driver, "collision_notified", False):
+                    driver.collision_notified = True
+                    driver.failed_laps = getattr(driver, 'failed_laps', 0) + 1
+                    driver.lap_notified_fail = True
+                    max_fails = meta.get("maxFails", "?")
+                    send_chat(server_state, car_id, f"[EVENT] Lap FAILED: Collision ({driver.failed_laps}/{max_fails} fails)")
+                    send_admin_command(server_state, f"/pit {car_id}")
+
     # ─── LAP_COMPLETED (58) ─────────────────────────────────
     elif packet_type == ACSP.LAP_COMPLETED:
         car_id      = parser.read_uint8()
@@ -206,8 +336,51 @@ def process_packet(data, server_state, addr):
         driver.lap_count += 1
         is_valid = (cuts == 0)
 
+        # Get active event settings to check constraints
+        event = get_active_server_event(server_state.server_name)
+        if not event:
+            event = get_active_server_event(server_state.config_server_name)
+
+        meta = event.get("metadata", {}) if event else {}
+        
+        fail_reason = ""
+
+        if meta.get("enableCollisions", False) and getattr(driver, "had_collision", False):
+            is_valid = False
+            fail_reason = "Collision"
+
+        if meta.get("detectIdle", False) and getattr(driver, "was_idle", False) and driver.lap_count >= 1:
+            is_valid = False
+            fail_reason = "Stopped on track (>5s)"
+
+        # Set Restart Check using standard AC time metrics:
+        # If AC detects cuts > 0 (e.g. they teleported to pits or went out of track), track it here.
+        # Note: If cuts > 0 and lap time is abnormally small, usually a teleport. AC marks cuts naturally.
+        if cuts > 0:
+            is_valid = False
+            fail_reason = "Track Cut / Teleport"
+
+        total_laps = meta.get("totalLaps", "?")
+        max_fails  = meta.get("maxFails", "?")
+        was_notified = getattr(driver, 'lap_notified_fail', False)
+
+        # Reset real-time tracking constraints for the next lap
+        driver.lap_start_time = now
+        driver.had_collision  = False
+        driver.restarted_lap  = False
+        driver.was_idle       = False
+        driver.lap_notified_fail  = False
+        driver.collision_notified = False
+        driver.idle_notified      = False
+
         if not is_valid:
-            driver.failed_laps = getattr(driver, 'failed_laps', 0) + 1
+            if not was_notified:
+                driver.failed_laps = getattr(driver, 'failed_laps', 0) + 1
+                fail_reason_display = fail_reason if fail_reason else "Track Cut"
+                send_chat(server_state, car_id, f"[EVENT] Lap FAILED: {fail_reason_display} ({driver.failed_laps}/{max_fails} fails)")
+                # If they already teleported (Track Cut / Teleport), we might not need to send /pit, but it's safe to enforce it.
+                send_admin_command(server_state, f"/pit {car_id}")
+            
             print(f"🏁 [{server_state.port}] [LAP] ⚠️  INVALID | {driver.name} | {ac_lap_time/1000:.3f}s | Cuts: {cuts}")
             return
 
@@ -215,6 +388,7 @@ def process_packet(data, server_state, addr):
             driver.best_lap = ac_lap_time
 
         print(f"🏁 [{server_state.port}] [LAP] ✅ | {driver.name} | Lap #{driver.lap_count} | {ac_lap_time/1000:.3f}s | Best: {driver.best_lap/1000:.3f}s")
+        send_chat(server_state, car_id, f"[EVENT] Lap {driver.lap_count}/{total_laps} COMPLETED! Time: {ac_lap_time/1000:.3f}s")
 
         if not driver.guid.startswith('unknown_'):
             save_lap(driver.guid, driver.model, server_state.track, server_state.config,
