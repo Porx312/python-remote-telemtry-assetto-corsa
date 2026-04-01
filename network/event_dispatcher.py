@@ -18,10 +18,48 @@ To add a new event type:
 import os
 import threading
 import requests
-from database import get_active_server_event
+from db.database import get_active_server_event
 
 ACAPI_KEY      = os.getenv("API_KEY", "")
 WEBHOOK_SECRET = os.getenv("EVENT_WEBHOOK_SECRET", "default_secret")
+# Node.js backend URL for general server events
+GENERAL_WEBHOOK_URL = os.getenv("SERVER_EVENT_WEBHOOK_URL")
+
+# ─────────────────────────────────────────────────────────────
+# General Server Event Dispatcher
+# ─────────────────────────────────────────────────────────────
+
+def send_server_event(event_type, server_name, data):
+    """
+    Dispatches a general server event (player_join, player_leave, lap_completed, server_status)
+    to the centralized Node.js backend.
+    """
+    def _send():
+        try:
+            payload = {
+                "event": event_type,
+                "serverName": server_name,
+                "data": data
+            }
+            # Omit serverName for lap_completed as requested by spec (it only asks for data inside lap_completed)
+            if event_type == "lap_completed":
+                del payload["serverName"]
+                
+            resp = requests.post(
+                GENERAL_WEBHOOK_URL,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-webhook-secret": WEBHOOK_SECRET
+                },
+                timeout=5
+            )
+            if resp.status_code >= 400:
+                print(f"⚠️ [GENERAL-WEBHOOK] {event_type} failed with {resp.status_code}: {resp.text}")
+        except Exception as e:
+            print(f"❌ [GENERAL-WEBHOOK] Network error dispatching '{event_type}': {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -125,5 +163,67 @@ def dispatch_event(server_state, driver, lap_time_ms=None, drift_score=None, is_
 
         except Exception as e:
             print(f"❌ [{server_state.port}] [EVENTS] Error dispatching: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
+
+def dispatch_battle_webhook(server_state, battle_config, p1_score, p2_score, winner_guid, points_log):
+    """
+    Sends the live Touge Battle score to the configured webhook url inside battle_config.
+    """
+    def _send():
+        try:
+            webhook_url = battle_config.get("webhook_url")
+            if not webhook_url:
+                return
+            
+            secret = battle_config.get("webhook_secret") or WEBHOOK_SECRET
+
+            # Prepare telemetry info
+            p1_guid = battle_config.get("player1_steam_id")
+            p2_guid = battle_config.get("player2_steam_id")
+            meta = battle_config.get("metadata", {})
+            
+            p1_car = meta.get("player1Car", "")
+            p2_car = meta.get("player2Car", "")
+            p1_name = meta.get("player1Name", "")
+            p2_name = meta.get("player2Name", "")
+            track = meta.get("track", "")
+            track_cfg = meta.get("trackConfig", "")
+
+            status = "finished" if winner_guid else "active"
+
+            payload = {
+                "battleId": battle_config.get("battle_id"),
+                "player1SteamId": p1_guid,
+                "player2SteamId": p2_guid,
+                "player1Score": p1_score,
+                "player2Score": p2_score,
+                "player1Car": p1_car,
+                "player2Car": p2_car,
+                "player1Name": p1_name,
+                "player2Name": p2_name,
+                "pointsLog": points_log or [],
+                "status": status,
+                "serverName": server_state.server_name,
+                "track": track,
+                "trackConfig": track_cfg
+            }
+            if winner_guid:
+                payload["winnerSteamId"] = winner_guid
+
+            resp = requests.post(
+                webhook_url,
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-webhook-secret": secret,
+                },
+                timeout=10
+            )
+
+            print(f"📡 [{server_state.port}] [BATTLE-WEBHOOK] → HTTP {resp.status_code} | Status: {status}")
+
+        except Exception as e:
+            print(f"❌ [{server_state.port}] [BATTLE-WEBHOOK] Error dispatching: {e}")
 
     threading.Thread(target=_send, daemon=True).start()

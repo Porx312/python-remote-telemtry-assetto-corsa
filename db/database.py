@@ -1,4 +1,5 @@
 import mysql.connector
+from mysql.connector import pooling
 import os
 import time
 from dotenv import load_dotenv
@@ -7,27 +8,41 @@ load_dotenv()
 
 DB_HOST = os.getenv('DB_HOST', 'localhost')
 DB_USER = os.getenv('DB_USER', 'root')
-DB_PASS = os.getenv('DB_PASS', 'root') # Default fallback
+DB_PASS = os.getenv('DB_PASS', '') # Default fallback changed to empty string
 DB_NAME = os.getenv('DB_NAME', 'ac_server_db')
-DB_NAME_TEST = os.getenv('DB_NAME_TEST', 'ac_server_db')
 DB_PORT = int(os.getenv('DB_PORT', 3306))
 
-USE_TEST_DB = os.getenv('USE_TEST_DB', 'true').lower() == 'true'
+if os.getenv('USE_TEST_DB', 'false').lower() == 'true':
+    DB_NAME = 'ac_server_test'
 
-def get_db_name():
-    return DB_NAME_TEST if USE_TEST_DB else DB_NAME
+print(f"✅ Database connection configured for: {DB_NAME} on port {DB_PORT}")
 
-def get_connection(db_name=None):
-    if db_name is None:
-        db_name = get_db_name()
-        
-    return mysql.connector.connect(
+# Initialize the global connection pool
+db_pool = None
+try:
+    db_pool = mysql.connector.pooling.MySQLConnectionPool(
+        pool_name="mypool",
+        pool_size=5, # You can adjust the pool size as needed
+        pool_reset_session=True,
         host=DB_HOST,
         user=DB_USER,
         password=DB_PASS,
-        database=db_name,
+        database=DB_NAME,
         port=DB_PORT
     )
+except mysql.connector.Error as err:
+    print(f"❌ Error setting up connection pool: {err}")
+
+def get_connection():
+    if not db_pool:
+        return mysql.connector.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASS,
+            database=DB_NAME,
+            port=DB_PORT
+        )
+    return db_pool.get_connection()
 
 def init_db():
     try:
@@ -39,10 +54,9 @@ def init_db():
             port=DB_PORT
         )
         cursor = conn.cursor()
-        db_name = get_db_name()
         
-        cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}`")
-        cursor.execute(f"USE `{db_name}`")
+        cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{DB_NAME}`")
+        cursor.execute(f"USE `{DB_NAME}`")
         
         # Create drivers table
         cursor.execute("""
@@ -102,7 +116,7 @@ def init_db():
         conn.commit()
         cursor.close()
         conn.close()
-        print(f"✅ Database connection verified. Using database: {db_name}")
+        print(f"✅ Database connection verified. Using database: {DB_NAME}")
     except Exception as e:
         print(f"❌ Error initializing database: {e}")
 
@@ -217,11 +231,22 @@ def save_touge_battle(server_name, track, track_config, p1_guid, p2_guid, winner
     except Exception as e:
         print(f"❌ Error saving Touge Battle: {e}")
 
+_event_cache = {}
+
 def get_active_server_event(server_name, event_type=None):
     """
     Retorna la configuración del webhook activo para el server dado. Si event_type es
     None, retorna cualquier evento activo del servidor (el más reciente).
+    Usa un cache corto de 3 segundos para no saturar la BD.
     """
+    cache_key = f"{server_name}_{event_type}"
+    now = time.time()
+    
+    if cache_key in _event_cache:
+        cached_result, cached_time = _event_cache[cache_key]
+        if now - cached_time < 3.0:
+            return cached_result
+
     conn = None
     cursor = None
     try:
@@ -253,13 +278,71 @@ def get_active_server_event(server_name, event_type=None):
                     meta = json.loads(meta)
                 except:
                     meta = {}
-            return {
+            res = {
                 "webhook_url": row["webhook_url"],
                 "event_type":  row["event_type"],
                 "metadata":    meta
             }
+            _event_cache[cache_key] = (res, now)
+            return res
+        else:
+            _event_cache[cache_key] = (None, now)
+            return None
     except Exception as e:
         print(f"❌ Error getting active server event: {e}")
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+    return None
+
+_battle_cache = {}
+
+def get_active_battle_config(server_name):
+    """
+    Retorna la configuración de la batalla activa (desde server_battles) para el server dado. 
+    Usa cache corto de 3 segundos.
+    """
+    now = time.time()
+    if server_name in _battle_cache:
+        cached_result, cached_time = _battle_cache[server_name]
+        if now - cached_time < 3.0:
+            return cached_result
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        query = """
+            SELECT battle_id, player1_steam_id, player2_steam_id, webhook_url, webhook_secret, metadata
+            FROM server_battles
+            WHERE server_name = %s AND status = 'active'
+            ORDER BY id DESC LIMIT 1
+        """
+        cursor.execute(query, (server_name,))
+        row = cursor.fetchone()
+        
+        if row:
+            import json
+            meta = row["metadata"] if row["metadata"] else {}
+            if isinstance(meta, str):
+                try: meta = json.loads(meta)
+                except: meta = {}
+            res = {
+                "battle_id": row["battle_id"],
+                "player1_steam_id": row["player1_steam_id"],
+                "player2_steam_id": row["player2_steam_id"],
+                "webhook_url": row["webhook_url"],
+                "webhook_secret": row["webhook_secret"],
+                "metadata": meta
+            }
+            _battle_cache[server_name] = (res, now)
+            return res
+        else:
+            _battle_cache[server_name] = (None, now)
+            return None
+    except Exception as e:
+        print(f"❌ Error getting active battle config: {e}")
     finally:
         if cursor: cursor.close()
         if conn: conn.close()
