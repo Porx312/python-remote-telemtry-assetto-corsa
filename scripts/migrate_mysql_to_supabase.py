@@ -135,7 +135,7 @@ def migrate_drivers(mysql_cur, pg_cur, dry_run: bool, page_size: int = 500) -> i
 def migrate_laps(mysql_cur, pg_cur, dry_run: bool, page_size: int = 500) -> int:
     mysql_cur.execute(
         """
-        SELECT steam_id, car_model, track, COALESCE(track_config, '') AS track_config,
+        SELECT id, steam_id, car_model, track, COALESCE(track_config, '') AS track_config,
                server_name, lap_time, valid_lap, `timestamp`, `date`
         FROM lap_records
         ORDER BY id
@@ -157,13 +157,18 @@ def migrate_laps(mysql_cur, pg_cur, dry_run: bool, page_size: int = 500) -> int:
         )
         raise
 
+    # `id` NOT NULL en Drizzle sin default: hay que llevar el id desde MySQL.
     upsert_sql = """
     INSERT INTO lap_records (
-        steam_id, car_model, track, track_config, server_name,
+        id, steam_id, car_model, track, track_config, server_name,
         lap_time, valid_lap, "timestamp", "date"
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s::timestamptz, NOW()))
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (steam_id, car_model, track, track_config) DO UPDATE SET
+        id = CASE
+            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED.id
+            ELSE lap_records.id
+        END,
         lap_time = CASE
             WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED.lap_time
             ELSE lap_records.lap_time
@@ -181,7 +186,7 @@ def migrate_laps(mysql_cur, pg_cur, dry_run: bool, page_size: int = 500) -> int:
             ELSE lap_records.server_name
         END,
         "date" = CASE
-            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN COALESCE(EXCLUDED."date", lap_records."date")
+            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED."date"
             ELSE lap_records."date"
         END
     """
@@ -195,9 +200,17 @@ def migrate_laps(mysql_cur, pg_cur, dry_run: bool, page_size: int = 500) -> int:
         ts = r.get("timestamp")
         if ts is not None:
             ts = int(ts)
-        lap_date = _norm_ts(r.get("date"))
+        raw_date = r.get("date")
+        if raw_date is None:
+            lap_date_str = None
+        elif isinstance(raw_date, datetime):
+            lap_date_str = raw_date.isoformat(sep=" ", timespec="seconds")
+        else:
+            lap_date_str = str(raw_date)
+
         batch.append(
             (
+                int(r["id"]),
                 r["steam_id"],
                 r["car_model"],
                 r["track"],
@@ -206,7 +219,7 @@ def migrate_laps(mysql_cur, pg_cur, dry_run: bool, page_size: int = 500) -> int:
                 int(r["lap_time"]),
                 vd,
                 ts,
-                lap_date,
+                lap_date_str,
             )
         )
     if batch:
