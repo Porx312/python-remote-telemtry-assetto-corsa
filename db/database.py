@@ -1,6 +1,8 @@
 import json
 import os
 import time
+from datetime import datetime, timezone
+from typing import Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import psycopg2
@@ -77,6 +79,41 @@ def get_connection():
     if db_pool:
         return _PooledConn(db_pool.getconn())
     return psycopg2.connect(DATABASE_URL)
+
+
+# Cache: si `id` es IDENTITY en Supabase, hace falta OVERRIDING SYSTEM VALUE al insertar un id explícito.
+_lap_id_is_identity: Optional[bool] = None
+
+
+def _lap_id_needs_overriding(cursor) -> bool:
+    global _lap_id_is_identity
+    if _lap_id_is_identity is not None:
+        return _lap_id_is_identity
+    try:
+        cursor.execute(
+            """
+            SELECT COALESCE(
+                (SELECT c.is_identity = 'YES'
+                 FROM information_schema.columns c
+                 WHERE c.table_schema = 'public'
+                   AND c.table_name = 'lap_records'
+                   AND c.column_name = 'id'),
+                false
+            )
+            """
+        )
+        row = cursor.fetchone()
+        _lap_id_is_identity = bool(row and row[0])
+    except Exception:
+        _lap_id_is_identity = False
+    return _lap_id_is_identity
+
+
+def _next_lap_record_id(cursor) -> int:
+    """Drizzle define `id` sin SERIAL: generamos el siguiente entero (misma idea que AUTO_INCREMENT)."""
+    cursor.execute("SELECT COALESCE(MAX(id), 0) FROM lap_records")
+    row = cursor.fetchone()
+    return int(row[0]) + 1
 
 
 def init_db():
@@ -212,9 +249,16 @@ def save_lap(steam_id, car_model, track, track_config, server_name, lap_time, va
             timestamp = int(time.time() * 1000)
 
         valid_int = 1 if valid else 0
-        query = """
-        INSERT INTO lap_records (steam_id, car_model, track, track_config, server_name, lap_time, valid_lap, "timestamp")
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        new_id = _next_lap_record_id(cursor)
+        use_ov = _lap_id_needs_overriding(cursor)
+        between = "\n    OVERRIDING SYSTEM VALUE\n    " if use_ov else "\n    "
+        # Columna `date` en Drizzle es text; ISO evita null si la columna pasó a NOT NULL en algún deploy.
+        date_str = datetime.now(timezone.utc).isoformat()
+
+        query = f"""
+        INSERT INTO lap_records (
+            id, steam_id, car_model, track, track_config, server_name, lap_time, valid_lap, "timestamp", "date"
+        ){between}VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (steam_id, car_model, track, track_config) DO UPDATE SET
             lap_time = CASE
                 WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED.lap_time
@@ -228,11 +272,26 @@ def save_lap(steam_id, car_model, track, track_config, server_name, lap_time, va
                 WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED."timestamp"
                 ELSE lap_records."timestamp"
             END,
-            server_name = EXCLUDED.server_name
+            server_name = EXCLUDED.server_name,
+            "date" = CASE
+                WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED."date"
+                ELSE lap_records."date"
+            END
         """
         cursor.execute(
             query,
-            (steam_id, car_model, track, track_config, server_name, lap_time, valid_int, timestamp),
+            (
+                new_id,
+                steam_id,
+                car_model,
+                track,
+                track_config,
+                server_name,
+                lap_time,
+                valid_int,
+                timestamp,
+                date_str,
+            ),
         )
         conn.commit()
         cursor.close()
