@@ -82,6 +82,67 @@ def _norm_track_config(v):
     return str(v)
 
 
+def _lap_records_id_is_identity(pg_cur) -> bool:
+    """Si `id` es IDENTITY, Postgres ignora valores explícitos salvo OVERRIDING SYSTEM VALUE."""
+    try:
+        pg_cur.execute(
+            """
+            SELECT COALESCE(
+                (SELECT c.is_identity = 'YES'
+                 FROM information_schema.columns c
+                 WHERE c.table_schema = 'public'
+                   AND c.table_name = 'lap_records'
+                   AND c.column_name = 'id'),
+                false
+            )
+            """
+        )
+        row = pg_cur.fetchone()
+        return bool(row and row[0])
+    except Exception:
+        return False
+
+
+def build_lap_upsert_sql(use_overriding_identity: bool) -> str:
+    """INSERT … ON CONFLICT para lap_records."""
+    between_cols_and_values = (
+        "\n    OVERRIDING SYSTEM VALUE\n    "
+        if use_overriding_identity
+        else "\n    "
+    )
+    return f"""
+    INSERT INTO lap_records (
+        id, steam_id, car_model, track, track_config, server_name,
+        lap_time, valid_lap, "timestamp", "date"
+    ){between_cols_and_values}VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (steam_id, car_model, track, track_config) DO UPDATE SET
+        id = CASE
+            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED.id
+            ELSE lap_records.id
+        END,
+        lap_time = CASE
+            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED.lap_time
+            ELSE lap_records.lap_time
+        END,
+        valid_lap = CASE
+            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED.valid_lap
+            ELSE lap_records.valid_lap
+        END,
+        "timestamp" = CASE
+            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED."timestamp"
+            ELSE lap_records."timestamp"
+        END,
+        server_name = CASE
+            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED.server_name
+            ELSE lap_records.server_name
+        END,
+        "date" = CASE
+            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED."date"
+            ELSE lap_records."date"
+        END
+    """
+
+
 def ensure_lap_records_unique_for_upsert(pg_cur) -> None:
     """
     ON CONFLICT requiere un índice/constraint UNIQUE en esas columnas.
@@ -195,39 +256,15 @@ def migrate_laps(mysql_cur, pg_cur, dry_run: bool, page_size: int = 500) -> int:
         )
         raise
 
-    # `id` NOT NULL en Drizzle sin default: hay que llevar el id desde MySQL.
-    upsert_sql = """
-    INSERT INTO lap_records (
-        id, steam_id, car_model, track, track_config, server_name,
-        lap_time, valid_lap, "timestamp", "date"
+    # IDENTITY en Postgres: sin OVERRIDING SYSTEM VALUE el valor explícito de `id` se ignora → NULL → error NOT NULL.
+    id_is_identity = _lap_records_id_is_identity(pg_cur)
+    print(
+        f"   lap_records.id es IDENTITY: {id_is_identity} "
+        f"({'INSERT con OVERRIDING SYSTEM VALUE' if id_is_identity else 'INSERT explícito normal'})",
+        flush=True,
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (steam_id, car_model, track, track_config) DO UPDATE SET
-        id = CASE
-            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED.id
-            ELSE lap_records.id
-        END,
-        lap_time = CASE
-            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED.lap_time
-            ELSE lap_records.lap_time
-        END,
-        valid_lap = CASE
-            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED.valid_lap
-            ELSE lap_records.valid_lap
-        END,
-        "timestamp" = CASE
-            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED."timestamp"
-            ELSE lap_records."timestamp"
-        END,
-        server_name = CASE
-            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED.server_name
-            ELSE lap_records.server_name
-        END,
-        "date" = CASE
-            WHEN EXCLUDED.lap_time < lap_records.lap_time THEN EXCLUDED."date"
-            ELSE lap_records."date"
-        END
-    """
+
+    upsert_sql = build_lap_upsert_sql(id_is_identity)
     batch = []
     for r in rows:
         vd = r.get("valid_lap")
@@ -246,9 +283,10 @@ def migrate_laps(mysql_cur, pg_cur, dry_run: bool, page_size: int = 500) -> int:
         else:
             lap_date_str = str(raw_date)
 
+        pid = int(r["_pg_id"])
         batch.append(
             (
-                int(r["_pg_id"]),
+                pid,
                 r["steam_id"],
                 r["car_model"],
                 r["track"],
@@ -261,7 +299,14 @@ def migrate_laps(mysql_cur, pg_cur, dry_run: bool, page_size: int = 500) -> int:
             )
         )
     if batch:
-        execute_batch(pg_cur, upsert_sql, batch, page_size=page_size)
+        # executemany/execute_batch + ON CONFLICT a veces fallan con PgBouncer/psycopg2; fila a fila es fiable.
+        first = batch[0]
+        if first[0] is None:
+            raise RuntimeError("Bug interno: id nulo en la primera fila del batch")
+        for i, tup in enumerate(batch):
+            pg_cur.execute(upsert_sql, tup)
+            if i == 0 and os.getenv("MIGRATE_DEBUG"):
+                print(f"DEBUG primera fila enviada a Postgres: id={tup[0]!r} …", file=sys.stderr)
     return len(batch)
 
 
