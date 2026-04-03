@@ -15,7 +15,8 @@ Uso:
   python scripts/migrate_mysql_to_supabase.py --only drivers
   python scripts/migrate_mysql_to_supabase.py --only laps --batch-size 200
 
-Antes: ejecuta `init_db()` desde la app o crea las tablas en Supabase para que existan las restricciones UNIQUE.
+Si `lap_records` viene de Drizzle sin UNIQUE en (steam_id, car_model, track, track_config),
+el script intenta crear `lap_records_unique_lap` antes de los INSERT … ON CONFLICT.
 """
 
 from __future__ import annotations
@@ -81,6 +82,25 @@ def _norm_track_config(v):
     return str(v)
 
 
+def ensure_lap_records_unique_for_upsert(pg_cur) -> None:
+    """
+    ON CONFLICT requiere un índice/constraint UNIQUE en esas columnas.
+    Drizzle (ac-data) crea `lap_records` sin ese UNIQUE; lo añadimos si falta.
+    """
+    pg_cur.execute(
+        """
+        UPDATE lap_records SET track_config = COALESCE(track_config, '')
+        WHERE track_config IS NULL
+        """
+    )
+    pg_cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS lap_records_unique_lap
+        ON lap_records (steam_id, car_model, track, track_config)
+        """
+    )
+
+
 def migrate_drivers(mysql_cur, pg_cur, dry_run: bool, page_size: int = 500) -> int:
     mysql_cur.execute(
         "SELECT steam_id, name, created_at, updated_at FROM drivers ORDER BY steam_id"
@@ -124,6 +144,18 @@ def migrate_laps(mysql_cur, pg_cur, dry_run: bool, page_size: int = 500) -> int:
     rows = mysql_cur.fetchall()
     if dry_run:
         return len(rows)
+
+    try:
+        ensure_lap_records_unique_for_upsert(pg_cur)
+    except Exception as e:
+        print(
+            "\n❌ No se pudo crear el índice único en lap_records (necesario para ON CONFLICT).\n"
+            "   Suele ser por filas duplicadas con el mismo (steam_id, car_model, track, track_config).\n"
+            "   Revisa en Supabase SQL, borra o fusiona duplicados, y vuelve a ejecutar.\n"
+            f"   Detalle: {e}\n",
+            file=sys.stderr,
+        )
+        raise
 
     upsert_sql = """
     INSERT INTO lap_records (
