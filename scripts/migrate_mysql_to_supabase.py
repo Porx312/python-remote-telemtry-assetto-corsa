@@ -132,16 +132,54 @@ def migrate_drivers(mysql_cur, pg_cur, dry_run: bool, page_size: int = 500) -> i
     return len(batch)
 
 
+def _mysql_row_int_id(row: dict, key: str) -> int | None:
+    v = row.get(key)
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ensure_lap_row_ids(rows: list) -> None:
+    """
+    Postgres exige `id` NOT NULL. Rellena ids faltantes (MySQL raro o clave distinta en el dict).
+    Modifica cada dict in-place añadiendo `_pg_id` int.
+    """
+    mx = 0
+    for r in rows:
+        rid = _mysql_row_int_id(r, "lap_row_id") or _mysql_row_int_id(r, "id")
+        if rid is not None:
+            mx = max(mx, rid)
+    synth = mx
+    missing = 0
+    for r in rows:
+        rid = _mysql_row_int_id(r, "lap_row_id") or _mysql_row_int_id(r, "id")
+        if rid is None:
+            synth += 1
+            rid = synth
+            missing += 1
+        r["_pg_id"] = rid
+    if missing and os.getenv("MIGRATE_DEBUG"):
+        print(f"⚠️  {missing} filas sin id en MySQL; ids sintéticos a partir de {mx + 1}", file=sys.stderr)
+    if rows and os.getenv("MIGRATE_DEBUG"):
+        print("DEBUG claves primera fila MySQL:", list(rows[0].keys()), file=sys.stderr)
+
+
 def migrate_laps(mysql_cur, pg_cur, dry_run: bool, page_size: int = 500) -> int:
+    # lap_row_id: alias explícito (evita rarezas con la columna `id` en el cursor)
     mysql_cur.execute(
         """
-        SELECT id, steam_id, car_model, track, COALESCE(track_config, '') AS track_config,
+        SELECT `id` AS lap_row_id, steam_id, car_model, track, COALESCE(track_config, '') AS track_config,
                server_name, lap_time, valid_lap, `timestamp`, `date`
         FROM lap_records
-        ORDER BY id
+        ORDER BY `id`
         """
     )
     rows = mysql_cur.fetchall()
+    if not dry_run:
+        _ensure_lap_row_ids(rows)
     if dry_run:
         return len(rows)
 
@@ -210,7 +248,7 @@ def migrate_laps(mysql_cur, pg_cur, dry_run: bool, page_size: int = 500) -> int:
 
         batch.append(
             (
-                int(r["id"]),
+                int(r["_pg_id"]),
                 r["steam_id"],
                 r["car_model"],
                 r["track"],
