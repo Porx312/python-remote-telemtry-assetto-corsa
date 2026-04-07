@@ -1,11 +1,13 @@
 import math
+import os
+import threading
 import time
 
 # ===================================================
 # TEST MODE: True = allows 1 player for solo testing.
 # Set to False in production to require 2 players.
 # ===================================================
-TEST_MODE_1_PLAYER = True
+TEST_MODE_1_PLAYER = False
 
 # Points needed to win the series (Best of N)
 POINTS_TO_WIN = 2
@@ -13,6 +15,13 @@ POINTS_TO_WIN = 2
 # DNF detection: if a car is slower than this for this long during ACTIVE, opponent wins
 DNF_SPEED_KMH = 5.0       # km/h threshold to consider a car "stalled"
 DNF_TIME_SECONDS = 5.0    # seconds a car must be stalled before opponent earns the point
+COLLISION_MIN_IMPACT = float(os.getenv("COLLISION_MIN_IMPACT", "3.0"))
+COLLISION_MIN_REL_SPEED = float(os.getenv("COLLISION_MIN_REL_SPEED", "8.0"))
+MAX_BATTLE_GAP_METERS = float(os.getenv("MAX_BATTLE_GAP_METERS", "45.0"))
+# Seconds after showing point messages before /restart_session (pits)
+POINT_TO_PITS_DELAY_SEC = float(os.getenv("POINT_TO_PITS_DELAY_SEC", "3.0"))
+# After /restart_session, ignore gap-based aborts (avoids double restart at 0 km/h / bad positions)
+POST_RESTART_GAP_GRACE_SEC = float(os.getenv("BATTLE_POST_RESTART_GAP_GRACE_SEC", "15.0"))
 
 
 class CarState:
@@ -98,6 +107,71 @@ class BattleManager:
         self.judge_offset_spline = 0.03 # Draw tolerance
         self.overtake_margin_spline = 0.003 # Chase needs to be visibly ahead to pass
         self.active_start_time = 0.0
+        self._restart_timer = None
+        # guid -> display name (from telemetry); used in scoreboard chat lines
+        self.player_names = {}
+        # After session restart, skip prestart/launch gap aborts until this time (unix)
+        self._gap_abort_suppressed_until = 0.0
+
+    def set_driver_name(self, guid, name):
+        if not guid or not name or str(guid).startswith("unknown"):
+            return
+        self.player_names[guid] = str(name).strip()
+
+    def _display_name(self, guid):
+        if not guid:
+            return "?"
+        n = self.player_names.get(guid)
+        if n:
+            return n
+        return f"...{guid[-6:]}" if len(guid) > 6 else guid
+
+    def _scoreboard_line(self):
+        g1, g2 = self.battle.car1_guid, self.battle.car2_guid
+        return (
+            f"{self._display_name(g1)} {self.battle.car1_score} : "
+            f"{self._display_name(g2)} {self.battle.car2_score}"
+        )
+
+    def _pit_suffix(self):
+        """Short hint: next spawn pits (no countdown)."""
+        return " → pits"
+
+    def _format_point_broadcast(self, winner_guid, reason):
+        board = self._scoreboard_line()
+        pit = self._pit_suffix()
+        if reason == "draw":
+            return f"[TOUGE] DRAW | {board}{pit}"
+        if reason == "overtake":
+            return f"[TOUGE] OVERTAKE | {board}{pit}"
+        if reason == "outrun":
+            return f"[TOUGE] OUTRUN | {board}{pit}"
+        if reason == "dnf_lead_stalled":
+            return f"[TOUGE] DNF lead | {board}{pit}"
+        if reason == "dnf_chase_stalled":
+            return f"[TOUGE] DNF chase | {board}{pit}"
+        if reason == "collision_penalty":
+            return f"[TOUGE] HIT rear | {board}{pit}"
+        if reason == "collision_brake_check":
+            return f"[TOUGE] HIT brake | {board}{pit}"
+        return f"[TOUGE] PT {reason} | {board}{pit}"
+
+    def _cancel_restart_timer(self):
+        if self._restart_timer is not None:
+            self._restart_timer.cancel()
+            self._restart_timer = None
+
+    def _send_chat_sequence(self, items):
+        """Send in order: str → both; (guid, str) → one driver."""
+        if not self.on_chat_message or not items:
+            return
+        for item in items:
+            if isinstance(item, tuple) and len(item) == 2:
+                guid, msg = item
+                self.on_chat_message(guid, msg)
+            else:
+                self.on_chat_message(self.battle.car1_guid, item)
+                self.on_chat_message(self.battle.car2_guid, item)
 
     def get_distance(self, pos1, pos2):
         return math.sqrt((pos1[0]-pos2[0])**2 + (pos1[1]-pos2[1])**2 + (pos1[2]-pos2[2])**2)
@@ -113,11 +187,12 @@ class BattleManager:
         """Called when a player disconnects."""
         if driver_guid in self.cars:
             del self.cars[driver_guid]
-        if self.state in ["ARMED", "LAUNCHING", "ACTIVE"]:
+        if self.state in ["ARMED", "LAUNCHING", "ACTIVE", "WAITING_RESTART"]:
             print(f"[BATTLE] Player {driver_guid} disconnected. Cancelling battle.")
             self._reset_to_idle()
 
     def _reset_to_idle(self, full_reset=False):
+        self._cancel_restart_timer()
         self.state = "IDLE"
         self.condition_start_time = 0.0
         self.launch_trigger_time = 0.0
@@ -129,7 +204,10 @@ class BattleManager:
 
     def handle_collision(self, car1_guid, car2_guid, impact_speed):
         """Called by main.py on CE_COLLISION_WITH_CAR."""
-        if self.state != "ACTIVE" or TEST_MODE_1_PLAYER:
+        if self.state != "ACTIVE":
+            return
+        # In 1-player test mirroring mode, collisions are meaningless.
+        if not self.battle or self.battle.car1_guid == self.battle.car2_guid:
             return
             
         def _notify_both(msg):
@@ -139,16 +217,27 @@ class BattleManager:
 
         guids = {car1_guid, car2_guid}
         if self.battle.car1_guid not in guids or self.battle.car2_guid not in guids:
+            print(
+                f"⚠️ [BATTLE] Collision ignored: participants mismatch "
+                f"({car1_guid}, {car2_guid}) vs expected "
+                f"({self.battle.car1_guid}, {self.battle.car2_guid})"
+            )
             return
             
         lead_car  = self.cars[self.battle.lead_guid]
         chase_car = self.cars[self.battle.chase_guid]
         
-        # 1. Ignore "rubs" / light touches
-        # Note: Assetto Corsa impact_speed might be quite low or in m/s, so we lower the threshold to 4.0
-        if impact_speed < 4.0:
-            print(f"⚠️ [BATTLE] Light rub ignored. Impact speed: {impact_speed:.2f} (Lead: {lead_car.speed:.1f} km/h, Chase: {chase_car.speed:.1f} km/h)")
-            _notify_both(f"[TOUGE] Light rub ignored. Impact: {impact_speed:.1f}km/h.")
+        # 1) Ignore true light rubs only.
+        #    We consider a contact meaningful if either:
+        #    - impact is above threshold, or
+        #    - there is a clear speed delta (rear-end / brake check situations).
+        relative_speed = abs(chase_car.speed - lead_car.speed)
+        if impact_speed < COLLISION_MIN_IMPACT and relative_speed < COLLISION_MIN_REL_SPEED:
+            print(
+                f"⚠️ [BATTLE] Light rub ignored. Impact: {impact_speed:.2f}, "
+                f"Δspeed: {relative_speed:.1f} (Lead: {lead_car.speed:.1f}, Chase: {chase_car.speed:.1f})"
+            )
+            _notify_both(f"[TOUGE] rub OK ({impact_speed:.0f})")
             return
         
         # 2. Brake Checking Detection
@@ -157,12 +246,10 @@ class BattleManager:
         # we rule it a brake-check / blocking penalty against LEAD.
         if lead_car.speed < 40.0 or lead_car.speed < (chase_car.speed - 15.0):
             print(f"💥 [BATTLE] BRAKE CHECK PENALTY! Lead caused crash. Impact: {impact_speed:.2f}. (Lead: {lead_car.speed:.1f} km/h, Chase: {chase_car.speed:.1f} km/h)")
-            _notify_both(f"[TOUGE] BRAKE CHECK PENALTY! Lead ({self.battle.lead_guid}) caused collision.")
             self._award_point(self.battle.chase_guid, reason='collision_brake_check')
         else:
             # Standard rear-end collision, CHASE is at fault for not maintaining distance.
             print(f"💥 [BATTLE] COLLISION Penalty! Chase hit Lead. Impact: {impact_speed:.2f}. (Lead: {lead_car.speed:.1f} km/h, Chase: {chase_car.speed:.1f} km/h)")
-            _notify_both(f"[TOUGE] COLLISION PENALTY! Chase ({self.battle.chase_guid}) hit Lead.")
             self._award_point(self.battle.lead_guid, reason='collision_penalty')
 
     def _process_logic(self):
@@ -174,7 +261,8 @@ class BattleManager:
         min_players = 1 if TEST_MODE_1_PLAYER else 2
 
         if len(active_guids) < min_players:
-            if self.state not in ["IDLE", "FINISHED"]:
+            # WAITING_RESTART: telemetry often pauses during session swap; do not cancel the pit timer.
+            if self.state not in ["IDLE", "FINISHED", "WAITING_RESTART"]:
                 print(f"\n[BATTLE] Not enough players ({len(active_guids)}). Resetting.")
                 self._reset_to_idle(full_reset=True)
             return
@@ -188,6 +276,9 @@ class BattleManager:
         if not self.battle or set([self.battle.car1_guid, self.battle.car2_guid]) != set([c1_guid, c2_guid]):
             self.battle = TougeBattle(c1_guid, c2_guid)
             self._reset_to_idle(full_reset=True)
+
+        if self.state == "WAITING_RESTART":
+            return
 
         if self.state == "FINISHED":
             # Auto-reset after cooldown so a new battle can begin
@@ -220,10 +311,9 @@ class BattleManager:
                 # If they are cruising together, wait for someone to gun it
                 if car1.speed >= 25.0 or car2.speed >= 25.0:
                     self.state = "ARMED"
-                    self.battle.run_count = 0
                     print(f"⚡ [BATTLE] ARMED between {car1.guid} and {car2.guid}!")
                     if self.on_chat_message:
-                        msg = "[TOUGE] Battle ARMED! Roll to 40km/h side-by-side to start."
+                        msg = "[TOUGE] ARMED — ~40 side by side"
                         self.on_chat_message(car1.guid, msg)
                         self.on_chat_message(car2.guid, msg)
 
@@ -231,6 +321,19 @@ class BattleManager:
         # ARMED: Waiting for both cars to hit 40 km/h
         # ==========================
         elif self.state == "ARMED":
+            # Still loading / 0 km/h in pits: positions can look "far apart" — don't abort yet
+            if (
+                distance > MAX_BATTLE_GAP_METERS
+                and not TEST_MODE_1_PLAYER
+                and time.time() >= self._gap_abort_suppressed_until
+                and (car1.speed >= 12.0 or car2.speed >= 12.0)
+            ):
+                self._abort_run_no_point(
+                    f"prestart_gap_{distance:.1f}m",
+                    [f"[TOUGE] GAP pre ({distance:.0f}m) no PT{self._pit_suffix()}"],
+                )
+                return
+
             # Persist battle start to DB physically as soon as rolling start begins
             if self.battle_id is None and self.on_battle_start:
                 self.battle_id = self.on_battle_start(
@@ -242,13 +345,13 @@ class BattleManager:
                 self.launch_trigger_time = now
                 print(f"\n[BATTLE] ROLLING START DETECTED! Gap: {distance:.1f}m. Waiting for both cars to hit 40 km/h...")
                 if self.on_chat_message:
-                    msg = "[TOUGE] LAUNCHING! Both cars hit 40km/h. Checking for false start..."
+                    msg = "[TOUGE] GO — 40+"
                     self.on_chat_message(car1.guid, msg)
                     self.on_chat_message(car2.guid, msg)
             elif now - self.launch_trigger_time > 3.0 and self.launch_trigger_time != 0.0: # Only timeout if launch_trigger_time was set
                 print("[BATTLE] Timeout: opponent did not reach 40 km/h within 3s. Cancelling.")
                 if self.on_chat_message:
-                    msg = "[TOUGE] Launch timeout. Opponent did not reach 40km/h. Resetting."
+                    msg = "[TOUGE] T-out launch"
                     self.on_chat_message(car1.guid, msg)
                     self.on_chat_message(car2.guid, msg)
                 self._reset_to_idle()
@@ -257,25 +360,44 @@ class BattleManager:
         # LAUNCHING: Confirm both cars launch
         # ==========================
         elif self.state == "LAUNCHING":
+            if (
+                distance > MAX_BATTLE_GAP_METERS
+                and not TEST_MODE_1_PLAYER
+                and time.time() >= self._gap_abort_suppressed_until
+                and (car1.speed >= 12.0 or car2.speed >= 12.0)
+            ):
+                self._abort_run_no_point(
+                    f"launch_gap_{distance:.1f}m",
+                    [f"[TOUGE] GAP launch ({distance:.0f}m) no PT{self._pit_suffix()}"],
+                )
+                return
+
             if car1.speed > 40.0 and car2.speed > 40.0:
                 # Before starting ACTIVE, check for false start (Jump Start)
                 # In runs > 1, roles are predetermined. If Chase jumped and passed Lead, penalty!
                 if self.battle.run_count >= 1:
-                    pre_lead = self.battle.chase_guid
-                    pre_chase = self.battle.lead_guid
-                    # Calculate if pre_chase is ahead of pre_lead
-                    c_lead = self.cars[pre_lead]
-                    c_chase = self.cars[pre_chase]
+                    expected_lead = self.battle.chase_guid
+                    expected_chase = self.battle.lead_guid
+                    c_lead = self.cars[expected_lead]
+                    c_chase = self.cars[expected_chase]
                     jump_gap = (c_chase.spline - c_lead.spline) % 1.0
                     # If jump_gap < 0.5, chase is ahead of lead -> False Start
                     if jump_gap < 0.5 and jump_gap > 0.001:  # Added a small margin for side-by-side
-                        print(f"🚨 [BATTLE] FALSE START! Chase ({pre_chase}) jumped the start and passed Lead ({pre_lead}).")
-                        if self.on_chat_message:
-                            self.on_chat_message(pre_chase, "[TOUGE] FALSE START! You jumped the start.")
-                            self.on_chat_message(pre_lead, "[TOUGE] Opponent false started! Point awarded.")
-                        self.battle.lead_guid = pre_lead
-                        self.battle.chase_guid = pre_chase
-                        self._award_point(pre_lead, reason='false_start')
+                        nl = self._display_name(expected_lead)
+                        nc = self._display_name(expected_chase)
+                        order_line = f"L {nl} / C {nc}"
+                        print(
+                            f"🚨 [BATTLE] FALSE START | want {order_line} | "
+                            f"chase ahead of lead"
+                        )
+                        self._abort_run_no_point(
+                            "false_start",
+                            [
+                                (expected_chase, f"[TOUGE] FS CHASE | ok: {order_line}{self._pit_suffix()}"),
+                                (expected_lead, f"[TOUGE] FS | ok: {order_line}{self._pit_suffix()}"),
+                                f"[TOUGE] FS order | {order_line} no PT{self._pit_suffix()}",
+                            ],
+                        )
                         return
 
                 self.state = "ACTIVE"
@@ -310,8 +432,8 @@ class BattleManager:
                 
                 # Send starting message to both players regarding their position
                 if self.on_chat_message:
-                    self.on_chat_message(self.battle.lead_guid, "[TOUGE] ACTIVE! You are LEAD.")
-                    self.on_chat_message(self.battle.chase_guid, "[TOUGE] ACTIVE! You are CHASE.")
+                    self.on_chat_message(self.battle.lead_guid, "[TOUGE] LEAD")
+                    self.on_chat_message(self.battle.chase_guid, "[TOUGE] CHASE")
 
                 # Emit live score webhook to notify frontend the run started
                 if self.on_score_update:
@@ -320,7 +442,7 @@ class BattleManager:
             elif now - self.launch_trigger_time > 3.0:
                 print("[BATTLE] Timeout: opponent did not reach 40 km/h within 3s. Cancelling.")
                 if self.on_chat_message:
-                    msg = "[TOUGE] Launch timeout. Opponent did not reach 40km/h. Resetting."
+                    msg = "[TOUGE] T-out launch"
                     self.on_chat_message(car1.guid, msg)
                     self.on_chat_message(car2.guid, msg)
                 self._reset_to_idle()
@@ -345,28 +467,19 @@ class BattleManager:
             lead_stalled  = (now - self.car1_last_moving_time) >= DNF_TIME_SECONDS
             chase_stalled = (now - self.car2_last_moving_time) >= DNF_TIME_SECONDS
 
-            if lead_stalled and not TEST_MODE_1_PLAYER:
+            # Only score DNF if the opponent is still moving. When the AC session ends or both
+            # stop (pits / disconnect / loading), both speeds drop to 0 and we must not award
+            # "lead stalled" spuriously.
+            chase_still_racing = chase_car.speed >= DNF_SPEED_KMH
+            lead_still_racing = lead_car.speed >= DNF_SPEED_KMH
+
+            if lead_stalled and chase_still_racing and not TEST_MODE_1_PLAYER:
                 print(f"🚨 [BATTLE] DNF: LEAD ({self.battle.lead_guid}) stalled for {DNF_TIME_SECONDS}s. Point for CHASE!")
-                if self.on_chat_message:
-                    self.on_chat_message(self.battle.lead_guid, f"[TOUGE] DNF! You stalled for {DNF_TIME_SECONDS}s.")
-                    self.on_chat_message(self.battle.chase_guid, f"[TOUGE] Opponent DNF'd! Point awarded.")
                 self._award_point(self.battle.chase_guid, reason='dnf_lead_stalled')
                 return
-            if chase_stalled and not TEST_MODE_1_PLAYER:
+            if chase_stalled and lead_still_racing and not TEST_MODE_1_PLAYER:
                 print(f"🚨 [BATTLE] DNF: CHASE ({self.battle.chase_guid}) stalled for {DNF_TIME_SECONDS}s. Point for LEAD!")
-                if self.on_chat_message:
-                    self.on_chat_message(self.battle.chase_guid, f"[TOUGE] DNF! You stalled for {DNF_TIME_SECONDS}s.")
-                    self.on_chat_message(self.battle.lead_guid, f"[TOUGE] Opponent DNF'd! Point awarded.")
                 self._award_point(self.battle.lead_guid, reason='dnf_chase_stalled')
-                return
-
-            # If cars are too far apart during ACTIVE, reset
-            if distance > 45.0 and not TEST_MODE_1_PLAYER:
-                print(f"\n[BATTLE] Gap exceeded 45m while ACTIVE. Resetting to IDLE.")
-                if self.on_chat_message:
-                    self.on_chat_message(self.battle.car1_guid, "[TOUGE] Gap too large. Resetting.")
-                    self.on_chat_message(self.battle.car2_guid, "[TOUGE] Gap too large. Resetting.")
-                self._reset_to_idle()
                 return
 
             # 1. OVERTAKE: Chase passes Lead cleanly
@@ -374,9 +487,6 @@ class BattleManager:
             if (now - self.active_start_time) > 2.0:
                 if chase_car.driven_spline > (lead_car.driven_spline + self.battle.initial_gap_spline + self.overtake_margin_spline):
                     print(f"🏎️💨 [BATTLE] OVERTAKE! CHASE ({self.battle.chase_guid}) cleanly passed the LEAD!")
-                    if self.on_chat_message:
-                        self.on_chat_message(self.battle.chase_guid, "[TOUGE] OVERTAKE! Point awarded to you.")
-                        self.on_chat_message(self.battle.lead_guid, "[TOUGE] OVERTAKE! Opponent passed you.")
                     self._award_point(self.battle.chase_guid, reason='overtake')
                     return
 
@@ -387,15 +497,9 @@ class BattleManager:
 
                 if is_draw:
                     print(f"🏁 [BATTLE] FINISH — DRAW. Chase gap: {chase_gap:.4f} spline")
-                    if self.on_chat_message:
-                        self.on_chat_message(self.battle.car1_guid, "[TOUGE] DRAW! No point awarded.")
-                        self.on_chat_message(self.battle.car2_guid, "[TOUGE] DRAW! No point awarded.")
                     self._award_point(None, reason='draw')
                 else:
                     print(f"🏁 [BATTLE] FINISH — OUTRUN. Gap: {chase_gap:.4f}. Point for LEAD!")
-                    if self.on_chat_message:
-                        self.on_chat_message(self.battle.lead_guid, "[TOUGE] OUTRUN! Point awarded to you.")
-                        self.on_chat_message(self.battle.chase_guid, "[TOUGE] OUTRUN! Opponent finished ahead.")
                     self._award_point(self.battle.lead_guid)
 
     def _award_point(self, winner_guid, reason='outrun'):
@@ -415,7 +519,6 @@ class BattleManager:
         else:
             log_msg = f"DRAW ({reason})"
 
-        # Log the point event
         self.battle.points_log.append({
             'scorer': winner_guid,
             'reason': reason,
@@ -423,44 +526,97 @@ class BattleManager:
         })
 
         print(f"🏅 {log_msg}. Score: {self.battle.car1_score} - {self.battle.car2_score}")
-        
-        # Send chat message to players about the point
-        _notify_both(f"[TOUGE] {log_msg}. Score: {self.battle.car1_score} - {self.battle.car2_score}")
 
-        # Best of N: first to POINTS_TO_WIN wins the series
+        _notify_both(self._format_point_broadcast(winner_guid, reason))
+
+        series_done = False
         if self.battle.car1_score >= POINTS_TO_WIN:
             self.battle.winner = self.battle.car1_guid
-            _notify_both(f"[TOUGE] SERIES WON BY {self.battle.winner}!")
+            series_done = True
             print(f"🏆 [BATTLE] SERIES OVER! WINNER: {self.battle.winner}")
-            self._end_run(is_series_end=True) # Immediately stop the active run logic
-            self.state = "FINISHED" # override IDLE with FINISHED
-            # Save final result
-            if self.on_score_update:
-                self.on_score_update(self.battle_id, self.battle.car1_score, self.battle.car2_score, self.battle.winner, self.battle.points_log)
         elif self.battle.car2_score >= POINTS_TO_WIN:
             self.battle.winner = self.battle.car2_guid
-            _notify_both(f"[TOUGE] SERIES WON BY {self.battle.winner}!")
+            series_done = True
             print(f"🏆 [BATTLE] SERIES OVER! WINNER: {self.battle.winner}")
-            self._end_run(is_series_end=True) # Immediately stop the active run logic
-            self.state = "FINISHED" # override IDLE with FINISHED
-            # Save final result
+
+        if series_done:
+            wn = self._display_name(self.battle.winner)
+            _notify_both(f"[TOUGE] WIN {wn} | {self._scoreboard_line()}")
+
+        self.state = "WAITING_RESTART"
+        print(
+            f"⏳ [BATTLE] Session restart in {POINT_TO_PITS_DELAY_SEC:.1f}s "
+            f"(no countdown message to players)"
+        )
+
+        if series_done:
             if self.on_score_update:
-                self.on_score_update(self.battle_id, self.battle.car1_score, self.battle.car2_score, self.battle.winner, self.battle.points_log)
+                self.on_score_update(
+                    self.battle_id,
+                    self.battle.car1_score,
+                    self.battle.car2_score,
+                    self.battle.winner,
+                    self.battle.points_log,
+                )
+            self._schedule_end_run(is_series_end=True, set_finished_after=True)
         else:
-            # Save live score after each intermediate point
             if self.on_score_update:
-                self.on_score_update(self.battle_id, self.battle.car1_score, self.battle.car2_score, None, self.battle.points_log)
-            self._end_run()
+                self.on_score_update(
+                    self.battle_id,
+                    self.battle.car1_score,
+                    self.battle.car2_score,
+                    None,
+                    self.battle.points_log,
+                )
+            self._schedule_end_run(is_series_end=False)
+
+    def _schedule_end_run(self, is_series_end=False, set_finished_after=False):
+        """Tras mostrar mensajes de punto, espera y luego pide restart a pits."""
+        self._cancel_restart_timer()
+        delay = max(0.0, POINT_TO_PITS_DELAY_SEC)
+
+        def _fire():
+            self._restart_timer = None
+            if self.state != "WAITING_RESTART":
+                return
+            self._end_run(is_series_end)
+            if set_finished_after:
+                self.state = "FINISHED"
+
+        self._restart_timer = threading.Timer(delay, _fire)
+        self._restart_timer.daemon = True
+        self._restart_timer.start()
+
+    def _abort_run_no_point(self, reason, chat_sequence):
+        """
+        Aborts run with no point: send chat_sequence (English), then silent delay, then restart.
+        """
+        print(f"\n⚠️ [BATTLE] Run aborted ({reason}). No point awarded.")
+        self._send_chat_sequence(chat_sequence)
+        self.state = "WAITING_RESTART"
+        print(
+            f"⏳ [BATTLE] Session restart in {POINT_TO_PITS_DELAY_SEC:.1f}s "
+            f"(abort; no countdown message to players)"
+        )
+        self._schedule_end_run(is_series_end=False, set_finished_after=False)
 
 
-    def _end_run(self):
-        """Returns to IDLE and resets driven distances for the next run."""
+    def _end_run(self, is_series_end=False):
+        """Returns to IDLE/FINISHED and requests a server session restart."""
         self.state = "IDLE"
         self.condition_start_time = 0.0
         self.launch_trigger_time = 0.0
         for c in self.cars.values():
             c.driven_spline = 0.0
-            
-        print("🔄 [BATTLE] Run complete. Restarting session to return players to pits...")
+
+        if is_series_end:
+            print("🔄 [BATTLE] Series finished. Restarting session to send players to pits...")
+        else:
+            print("🔄 [BATTLE] Run complete. Restarting session to return players to pits...")
+
         if self.on_session_restart:
-            self.on_session_restart()
+            try:
+                self.on_session_restart()
+                self._gap_abort_suppressed_until = time.time() + POST_RESTART_GAP_GRACE_SEC
+            except Exception as e:
+                print(f"❌ [BATTLE] Failed to request /restart_session: {e}")

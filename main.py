@@ -2,6 +2,7 @@ import socket
 import select
 import threading
 import time
+import os
 from dotenv import load_dotenv
 
 from db.database import init_db
@@ -13,6 +14,7 @@ from network.event_dispatcher import send_server_event
 load_dotenv()
 
 SERVER_IP = '127.0.0.1'
+GHOST_DRIVER_TIMEOUT_MS = int(os.getenv("GHOST_DRIVER_TIMEOUT_MS", "90000"))
 
 # ──────────────────────────────────────────────
 # SERVER LISTENER THREAD
@@ -70,14 +72,37 @@ def server_status_loop(servers):
                 time.sleep(0.01)
 
             # Build list of active players safely (values might change during loop)
+            now_ms = int(time.time() * 1000)
             players = []
-            for d in list(state.active_drivers.values()):
+            stale_car_ids = []
+            for car_id, d in list(state.active_drivers.items()):
+                last_seen = getattr(d, "last_seen_ms", 0)
+                if last_seen and (now_ms - last_seen) > GHOST_DRIVER_TIMEOUT_MS:
+                    stale_car_ids.append(car_id)
+                    continue
                 if not d.guid.startswith('unknown_'):
                     players.append({
                         "steamId": d.guid,
                         "name": d.name,
                         "carModel": d.model
                     })
+
+            # Purga defensiva de "ghost players" cuando no llegaron paquetes de salida.
+            for car_id in stale_car_ids:
+                d = state.active_drivers.get(car_id)
+                if not d:
+                    continue
+                if d.guid in state.guid_to_driver:
+                    del state.guid_to_driver[d.guid]
+                del state.active_drivers[car_id]
+                if not d.guid.startswith('unknown_'):
+                    send_server_event("player_leave", getattr(state, 'config_server_name', state.server_name), {
+                        "steamId": d.guid,
+                        "trackName": state.track,
+                        "trackConfig": state.config
+                    })
+            if stale_car_ids:
+                print(f"🧹 [{state.port}] Purga estado: {len(stale_car_ids)} ghost(s) removidos por timeout")
             
             send_server_event("server_status", getattr(state, 'config_server_name', state.server_name), {
                 "players": players,

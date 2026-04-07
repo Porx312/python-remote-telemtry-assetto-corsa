@@ -10,6 +10,7 @@ class DriverInfo:
         self.name = name
         self.guid = guid
         self.model = model
+        self.last_seen_ms = int(time.time() * 1000)
         self.lap_count = 0
         self.best_lap = 0
         self.last_lap = 0
@@ -56,13 +57,21 @@ class ServerState:
         )
 
     def _get_battle(self):
-        # We try explicit names from AC packet vs DB, and fallback
-        battle = get_active_battle_config(self.server_name)
-        if not battle:
-            battle = get_active_battle_config(self.config_server_name)
-        if not battle:
-            battle = get_active_battle_config("server")
-        return battle
+        # Nombres desde AC / ini pueden diferir en espacios; Supabase debe coincidir.
+        names = [
+            (self.server_name or "").strip(),
+            (self.config_server_name or "").strip(),
+            "server",
+        ]
+        seen = set()
+        for n in names:
+            if not n or n in seen:
+                continue
+            seen.add(n)
+            battle = get_active_battle_config(n)
+            if battle:
+                return battle
+        return None
 
     def handle_battle_start(self, car1_guid, car2_guid):
         config = self._get_battle()

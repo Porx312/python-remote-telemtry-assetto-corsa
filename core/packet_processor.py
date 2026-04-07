@@ -6,6 +6,50 @@ from core.session_manager import DriverInfo, send_registration, send_chat, send_
 from db.database import save_driver, save_lap, get_active_server_event
 from network.event_dispatcher import dispatch_event, dispatch_battle_webhook, send_server_event
 
+MIN_VALID_LAP_MS = int(os.getenv("MIN_VALID_LAP_MS", "10000"))
+GHOST_DRIVER_TIMEOUT_MS = int(os.getenv("GHOST_DRIVER_TIMEOUT_MS", "90000"))
+
+
+def _mark_driver_seen(driver):
+    driver.last_seen_ms = int(time.time() * 1000)
+
+
+def _battle_guids(battle_cfg):
+    p1 = (battle_cfg.get("player1_steam_id") or "").strip()
+    p2 = (battle_cfg.get("player2_steam_id") or "").strip()
+    return p1, p2
+
+
+def _is_battle_player(guid, battle_cfg):
+    if not guid or not battle_cfg:
+        return False
+    g = guid.strip()
+    p1, p2 = _battle_guids(battle_cfg)
+    return g == p1 or g == p2
+
+
+def _drop_stale_drivers_on_new_session(server_state, now_ms):
+    """
+    Tras reinicios/rotaciones del server pueden quedar drivers "fantasma" en memoria
+    si no llegó CONNECTION_CLOSED. Solo quita entradas con last_seen antiguo (no borrar
+    a todos los que last_seen==0: eso vaciaba el lobby y rompía batallas).
+    """
+    removed = 0
+    for car_id, driver in list(server_state.active_drivers.items()):
+        last_seen = getattr(driver, "last_seen_ms", 0)
+        if last_seen <= 0:
+            continue
+        if (now_ms - last_seen) <= GHOST_DRIVER_TIMEOUT_MS:
+            continue
+        if driver.guid in server_state.guid_to_driver:
+            del server_state.guid_to_driver[driver.guid]
+        server_state.battle_manager.remove_car(driver.guid)
+        del server_state.active_drivers[car_id]
+        removed += 1
+    if removed:
+        print(f"🧹 [{server_state.port}] Limpieza NEW_SESSION: {removed} ghost(s) removidos")
+
+
 def process_packet(data, server_state, addr):
     # Auto-connect logic: register once per server startup/connection when we see traffic
     server_ip = addr[0]
@@ -22,6 +66,9 @@ def process_packet(data, server_state, addr):
 
     # ─── NEW_SESSION (50) ───────────────────────────────────
     if packet_type == ACSP.NEW_SESSION:
+        now_ms = int(time.time() * 1000)
+        _drop_stale_drivers_on_new_session(server_state, now_ms)
+
         parser.read_uint8()   # version
         parser.read_uint8()   # sessionIndex
         parser.read_uint8()   # currentSessionIndex
@@ -92,11 +139,13 @@ def process_packet(data, server_state, addr):
         if not name or not guid: return
 
         driver = DriverInfo(name, guid, model)
+        _mark_driver_seen(driver)
         server_state.active_drivers[car_id] = driver
         if guid and not guid.startswith('unknown_'):
             server_state.guid_to_driver[guid] = driver
 
         print(f"🟢 [{server_state.port}] [CONNECTED] CarID {car_id} | {name} | {model} | {guid}")
+        server_state.battle_manager.set_driver_name(guid, name)
         save_driver(guid, name, model)
 
         driver.lap_start_time = time.time() * 1000
@@ -107,7 +156,7 @@ def process_packet(data, server_state, addr):
             
             # Send battle webhook on connect so frontend knows player is alive
             battle_cfg = server_state._get_battle()
-            if battle_cfg and guid in (battle_cfg.get('player1_steam_id'), battle_cfg.get('player2_steam_id')):
+            if battle_cfg and _is_battle_player(guid, battle_cfg):
                 if server_state.battle_manager.battle:
                     p1_score = server_state.battle_manager.battle.car1_score
                     p2_score = server_state.battle_manager.battle.car2_score
@@ -115,6 +164,12 @@ def process_packet(data, server_state, addr):
                 else:
                     p1_score, p2_score, points_log = 0, 0, []
                 dispatch_battle_webhook(server_state, battle_cfg, p1_score, p2_score, None, points_log)
+            elif battle_cfg:
+                p1, p2 = _battle_guids(battle_cfg)
+                print(
+                    f"⚠️ [{server_state.port}] [BATTLE] GUID no coincide para {name}: "
+                    f"'{guid.strip()}' vs esperados '{p1}' / '{p2}'"
+                )
 
             # Node.js General Webhook
             send_server_event("player_join", server_state.server_name, {
@@ -145,7 +200,7 @@ def process_packet(data, server_state, addr):
                 
                 # Despawn Battle logic
                 battle_cfg = server_state._get_battle()
-                if battle_cfg and driver.guid in (battle_cfg.get('player1_steam_id'), battle_cfg.get('player2_steam_id')):
+                if battle_cfg and _is_battle_player(driver.guid, battle_cfg):
                     if server_state.battle_manager.battle:
                         p1_score = server_state.battle_manager.battle.car1_score
                         p2_score = server_state.battle_manager.battle.car2_score
@@ -174,16 +229,19 @@ def process_packet(data, server_state, addr):
         driver = server_state.active_drivers.get(car_id)
         if not driver:
             driver = DriverInfo(name, guid, model)
+            _mark_driver_seen(driver)
             server_state.active_drivers[car_id] = driver
         else:
             driver.name = name
             driver.guid = guid
             driver.model = model
+            _mark_driver_seen(driver)
             
         if guid and not guid.startswith('unknown_'):
             server_state.guid_to_driver[guid] = driver
 
         print(f"🏎️ [{server_state.port}] [CAR_INFO] CarID {car_id} | {name} | {model} | {guid}")
+        server_state.battle_manager.set_driver_name(guid, name)
         save_driver(guid, name, model)
 
     # ─── CONNECTION_CLOSED (52) ─────────────────────────────
@@ -200,7 +258,7 @@ def process_packet(data, server_state, addr):
                 dispatch_event(server_state, driver, driver.last_lap, is_finished=True)
                 
                 battle_cfg = server_state._get_battle()
-                if battle_cfg and driver.guid in (battle_cfg.get('player1_steam_id'), battle_cfg.get('player2_steam_id')):
+                if battle_cfg and _is_battle_player(driver.guid, battle_cfg):
                     if server_state.battle_manager.battle:
                         p1_score = server_state.battle_manager.battle.car1_score
                         p2_score = server_state.battle_manager.battle.car2_score
@@ -237,6 +295,7 @@ def process_packet(data, server_state, addr):
         
         driver = server_state.active_drivers.get(car_id)
         if driver:
+            _mark_driver_seen(driver)
             speed_ms = ((v_x or 0)**2 + (v_y or 0)**2 + (v_z or 0)**2)**0.5
             now = int(time.time() * 1000)
             
@@ -249,11 +308,10 @@ def process_packet(data, server_state, addr):
 
             # Feed BattleManager if active
             battle_cfg = server_state._get_battle()
-            if battle_cfg:
-                p1 = battle_cfg.get("player1_steam_id")
-                p2 = battle_cfg.get("player2_steam_id")
-                if driver.guid in (p1, p2):
-                    server_state.battle_manager.update(driver.guid, spline, speed_ms * 3.6, (pos_x, pos_y, pos_z))
+            if battle_cfg and _is_battle_player(driver.guid, battle_cfg):
+                server_state.battle_manager.update(
+                    driver.guid, spline, speed_ms * 3.6, (pos_x, pos_y, pos_z)
+                )
 
     # ─── CLIENT_EVENT (130) ─────────────────────────────────
     elif packet_type == getattr(ACSP, 'CLIENT_EVENT', 130):
@@ -268,10 +326,12 @@ def process_packet(data, server_state, addr):
             driver2 = server_state.active_drivers.get(other_car_id)
             battle_cfg = server_state._get_battle()
             if battle_cfg and driver1 and driver2:
-                p1 = battle_cfg.get("player1_steam_id")
-                p2 = battle_cfg.get("player2_steam_id")
-                if driver1.guid in (p1, p2) and driver2.guid in (p1, p2):
-                    server_state.battle_manager.handle_collision(driver1.guid, driver2.guid, impact_speed)
+                if _is_battle_player(driver1.guid, battle_cfg) and _is_battle_player(
+                    driver2.guid, battle_cfg
+                ):
+                    server_state.battle_manager.handle_collision(
+                        driver1.guid, driver2.guid, impact_speed
+                    )
         elif ev_type == getattr(ACSP, 'CE_COLLISION_WITH_ENV', 11):
             pass # We don't track ENV collisions for battles yet
         
@@ -296,11 +356,20 @@ def process_packet(data, server_state, addr):
         if not driver:
             import struct
             driver = DriverInfo(f"Driver_CarID_{car_id}", f"unknown_{car_id}", "Unknown")
+            _mark_driver_seen(driver)
             server_state.active_drivers[car_id] = driver
             if server_state.last_server_addr:
                 server_state.sock.sendto(struct.pack('BB', 201, car_id), server_state.last_server_addr)
+        else:
+            _mark_driver_seen(driver)
 
         if ac_lap_time <= 0 or ac_lap_time > 36000000:
+            return
+
+        if ac_lap_time < MIN_VALID_LAP_MS:
+            print(
+                f"⚠️ [{server_state.port}] Lap ignorada por sospechosa ({ac_lap_time/1000:.3f}s < {MIN_VALID_LAP_MS/1000:.3f}s)"
+            )
             return
 
         driver.last_lap   = ac_lap_time

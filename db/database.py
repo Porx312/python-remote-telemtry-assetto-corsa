@@ -14,6 +14,7 @@ load_dotenv()
 
 # Supabase Postgres: Project Settings → Database → URI (usa sslmode=require)
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL", "")
+AC_INSTANCE_ID = (os.getenv("AC_INSTANCE_ID") or os.getenv("VPS_ID") or "").strip()
 
 if os.getenv("USE_TEST_DB", "false").lower() == "true":
     DATABASE_URL = os.getenv("TEST_DATABASE_URL") or DATABASE_URL
@@ -83,6 +84,7 @@ def get_connection():
 
 # Cache: si `id` es IDENTITY en Supabase, hace falta OVERRIDING SYSTEM VALUE al insertar un id explícito.
 _lap_id_is_identity: Optional[bool] = None
+_table_has_instance_id_cache = {}
 
 
 def _lap_id_needs_overriding(cursor) -> bool:
@@ -114,6 +116,31 @@ def _next_lap_record_id(cursor) -> int:
     cursor.execute("SELECT COALESCE(MAX(id), 0) FROM lap_records")
     row = cursor.fetchone()
     return int(row[0]) + 1
+
+
+def _table_has_instance_id(cursor, table_name: str) -> bool:
+    cached = _table_has_instance_id_cache.get(table_name)
+    if cached is not None:
+        return cached
+    try:
+        cursor.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = %s
+                  AND column_name = 'instance_id'
+            )
+            """,
+            (table_name,),
+        )
+        row = cursor.fetchone()
+        has_col = bool(row and row[0])
+    except Exception:
+        has_col = False
+    _table_has_instance_id_cache[table_name] = has_col
+    return has_col
 
 
 def init_db():
@@ -195,6 +222,9 @@ def init_db():
         )
         """
         )
+        cursor.execute(
+            "ALTER TABLE IF EXISTS server_events ADD COLUMN IF NOT EXISTS instance_id TEXT"
+        )
 
         cursor.execute(
             """
@@ -212,6 +242,9 @@ def init_db():
             updated_at TIMESTAMPTZ DEFAULT NOW()
         )
         """
+        )
+        cursor.execute(
+            "ALTER TABLE IF EXISTS server_battles ADD COLUMN IF NOT EXISTS instance_id TEXT"
         )
 
         cursor.close()
@@ -378,7 +411,7 @@ def get_active_server_event(server_name, event_type=None):
     None, retorna cualquier evento activo del servidor (el más reciente).
     Usa un cache corto de 3 segundos para no saturar la BD.
     """
-    cache_key = f"{server_name}_{event_type}"
+    cache_key = f"{server_name}_{event_type}_{AC_INSTANCE_ID or '-'}"
     now = time.time()
 
     if cache_key in _event_cache:
@@ -391,22 +424,29 @@ def get_active_server_event(server_name, event_type=None):
     try:
         conn = get_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        if event_type:
-            query = """
-                SELECT webhook_url, event_type, metadata, event_status
-                FROM server_events
-                WHERE server_name = %s AND event_type = %s AND event_status = 'started'
-                ORDER BY id DESC LIMIT 1
-            """
-            cursor.execute(query, (server_name, event_type))
+        has_instance_id = _table_has_instance_id(cursor, "server_events")
+        if AC_INSTANCE_ID and has_instance_id:
+            instance_clause = " AND instance_id = %s"
+            instance_params = (AC_INSTANCE_ID,)
         else:
-            query = """
+            instance_clause = ""
+            instance_params = ()
+        if event_type:
+            query = f"""
                 SELECT webhook_url, event_type, metadata, event_status
                 FROM server_events
-                WHERE server_name = %s AND event_status = 'started'
+                WHERE server_name = %s AND event_type = %s AND event_status = 'started'{instance_clause}
                 ORDER BY id DESC LIMIT 1
             """
-            cursor.execute(query, (server_name,))
+            cursor.execute(query, (server_name, event_type, *instance_params))
+        else:
+            query = f"""
+                SELECT webhook_url, event_type, metadata, event_status
+                FROM server_events
+                WHERE server_name = %s AND event_status = 'started'{instance_clause}
+                ORDER BY id DESC LIMIT 1
+            """
+            cursor.execute(query, (server_name, *instance_params))
 
         row = cursor.fetchone()
         if row:
@@ -441,11 +481,13 @@ _battle_cache = {}
 def get_active_battle_config(server_name):
     """
     Retorna la configuración de la batalla activa (desde server_battles) para el server dado.
-    Usa cache corto de 3 segundos.
+    Cache de 3 s solo para filas encontradas; no cachea "sin batalla" para que una batalla
+    nueva en Supabase sea visible al instante.
     """
     now = time.time()
-    if server_name in _battle_cache:
-        cached_result, cached_time = _battle_cache[server_name]
+    cache_key = f"{server_name}_{AC_INSTANCE_ID or '-'}"
+    if cache_key in _battle_cache:
+        cached_result, cached_time = _battle_cache[cache_key]
         if now - cached_time < 3.0:
             return cached_result
 
@@ -454,13 +496,20 @@ def get_active_battle_config(server_name):
     try:
         conn = get_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        query = """
+        has_instance_id = _table_has_instance_id(cursor, "server_battles")
+        if AC_INSTANCE_ID and has_instance_id:
+            instance_clause = " AND instance_id = %s"
+            params = (server_name, AC_INSTANCE_ID)
+        else:
+            instance_clause = ""
+            params = (server_name,)
+        query = f"""
             SELECT battle_id, player1_steam_id, player2_steam_id, webhook_url, webhook_secret, metadata
             FROM server_battles
-            WHERE server_name = %s AND status = 'active'
+            WHERE server_name = %s AND status = 'active'{instance_clause}
             ORDER BY id DESC LIMIT 1
         """
-        cursor.execute(query, (server_name,))
+        cursor.execute(query, params)
         row = cursor.fetchone()
 
         if row:
@@ -478,9 +527,10 @@ def get_active_battle_config(server_name):
                 "webhook_secret": row["webhook_secret"],
                 "metadata": meta,
             }
-            _battle_cache[server_name] = (res, now)
+            _battle_cache[cache_key] = (res, now)
             return res
-        _battle_cache[server_name] = (None, now)
+        if cache_key in _battle_cache:
+            del _battle_cache[cache_key]
         return None
     except Exception as e:
         print(f"❌ Error getting active battle config: {e}")
