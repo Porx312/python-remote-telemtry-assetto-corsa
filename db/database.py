@@ -404,6 +404,7 @@ def save_touge_battle(server_name, track, track_config, p1_guid, p2_guid, winner
 
 _event_cache = {}
 _server_active_cache = {}
+_instance_gate_warned = False
 
 
 def is_server_active_for_instance(server_name: str) -> bool:
@@ -415,8 +416,12 @@ def is_server_active_for_instance(server_name: str) -> bool:
     name = (server_name or "").strip()
     if not name:
         return False
+    global _instance_gate_warned
     if not AC_INSTANCE_ID:
-        return True
+        if not _instance_gate_warned:
+            print("⚠️ AC_INSTANCE_ID no definido: se bloquean battle/event por seguridad de instancia.")
+            _instance_gate_warned = True
+        return False
 
     cache_key = f"{name}_{AC_INSTANCE_ID}"
     now = time.time()
@@ -442,8 +447,8 @@ def is_server_active_for_instance(server_name: str) -> bool:
         )
         has_table = bool(cursor.fetchone()[0])
         if not has_table:
-            _server_active_cache[cache_key] = (True, now)
-            return True
+            _server_active_cache[cache_key] = (False, now)
+            return False
 
         cursor.execute(
             """
@@ -460,10 +465,10 @@ def is_server_active_for_instance(server_name: str) -> bool:
         is_active = bool(cursor.fetchone()[0])
         _server_active_cache[cache_key] = (is_active, now)
         return is_active
-    except Exception:
-        # fallback safe: no bloquear telemetría si el esquema aún no está completo
-        _server_active_cache[cache_key] = (True, now)
-        return True
+    except Exception as e:
+        print(f"⚠️ Instance gate error ({name}/{AC_INSTANCE_ID}): {e}")
+        _server_active_cache[cache_key] = (False, now)
+        return False
     finally:
         if cursor:
             cursor.close()
