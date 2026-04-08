@@ -403,6 +403,72 @@ def save_touge_battle(server_name, track, track_config, p1_guid, p2_guid, winner
 
 
 _event_cache = {}
+_server_active_cache = {}
+
+
+def is_server_active_for_instance(server_name: str) -> bool:
+    """
+    Verifica en ac_server_control que este server esté activo para ESTA instancia.
+    Si AC_INSTANCE_ID no está configurado o falta la tabla/columnas, hace fallback True
+    para no romper setups antiguos.
+    """
+    name = (server_name or "").strip()
+    if not name:
+        return False
+    if not AC_INSTANCE_ID:
+        return True
+
+    cache_key = f"{name}_{AC_INSTANCE_ID}"
+    now = time.time()
+    if cache_key in _server_active_cache:
+        val, ts = _server_active_cache[cache_key]
+        if now - ts < 3.0:
+            return val
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = 'ac_server_control'
+            )
+            """
+        )
+        has_table = bool(cursor.fetchone()[0])
+        if not has_table:
+            _server_active_cache[cache_key] = (True, now)
+            return True
+
+        cursor.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM ac_server_control
+                WHERE instance_id = %s
+                  AND server_name = %s
+                  AND COALESCE(power_state, 'stopped') = 'running'
+            )
+            """,
+            (AC_INSTANCE_ID, name),
+        )
+        is_active = bool(cursor.fetchone()[0])
+        _server_active_cache[cache_key] = (is_active, now)
+        return is_active
+    except Exception:
+        # fallback safe: no bloquear telemetría si el esquema aún no está completo
+        _server_active_cache[cache_key] = (True, now)
+        return True
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 
 def get_active_server_event(server_name, event_type=None):
@@ -418,6 +484,10 @@ def get_active_server_event(server_name, event_type=None):
         cached_result, cached_time = _event_cache[cache_key]
         if now - cached_time < 3.0:
             return cached_result
+
+    if not is_server_active_for_instance(server_name):
+        _event_cache[cache_key] = (None, now)
+        return None
 
     conn = None
     cursor = None
@@ -485,6 +555,8 @@ def get_active_battle_config(server_name):
     nueva en Supabase sea visible al instante.
     """
     now = time.time()
+    if not is_server_active_for_instance(server_name):
+        return None
     cache_key = f"{server_name}_{AC_INSTANCE_ID or '-'}"
     if cache_key in _battle_cache:
         cached_result, cached_time = _battle_cache[cache_key]
