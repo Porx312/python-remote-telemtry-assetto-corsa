@@ -500,6 +500,10 @@ def get_active_server_event(server_name, event_type=None):
         conn = get_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         has_instance_id = _table_has_instance_id(cursor, "server_events")
+        if AC_INSTANCE_ID and not has_instance_id:
+            # Fail-closed silently: ignore events if instance_id isolation is unavailable.
+            _event_cache[cache_key] = (None, now)
+            return None
         if AC_INSTANCE_ID and has_instance_id:
             instance_clause = " AND instance_id = %s"
             instance_params = (AC_INSTANCE_ID,)
@@ -574,6 +578,11 @@ def get_active_battle_config(server_name):
         conn = get_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         has_instance_id = _table_has_instance_id(cursor, "server_battles")
+        if AC_INSTANCE_ID and not has_instance_id:
+            # Fail-closed silently: ignore battles if instance_id isolation is unavailable.
+            if cache_key in _battle_cache:
+                del _battle_cache[cache_key]
+            return None
         if AC_INSTANCE_ID and has_instance_id:
             instance_clause = " AND instance_id = %s"
             params = (server_name, AC_INSTANCE_ID)

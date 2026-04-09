@@ -12,16 +12,18 @@ TEST_MODE_1_PLAYER = False
 # Points needed to win the series (Best of N)
 POINTS_TO_WIN = 2
 
-# DNF detection: if a car is slower than this for this long during ACTIVE, opponent wins
-DNF_SPEED_KMH = 5.0       # km/h threshold to consider a car "stalled"
-DNF_TIME_SECONDS = 5.0    # seconds a car must be stalled before opponent earns the point
 COLLISION_MIN_IMPACT = float(os.getenv("COLLISION_MIN_IMPACT", "3.0"))
 COLLISION_MIN_REL_SPEED = float(os.getenv("COLLISION_MIN_REL_SPEED", "8.0"))
+BRAKE_CHECK_DELTA_KMH = float(os.getenv("BRAKE_CHECK_DELTA_KMH", "8.0"))
 MAX_BATTLE_GAP_METERS = float(os.getenv("MAX_BATTLE_GAP_METERS", "45.0"))
+# If distance grows too much during ACTIVE, award lead by outrun immediately.
+OUTRUN_GAP_AUTO_POINT_METERS = float(os.getenv("OUTRUN_GAP_AUTO_POINT_METERS", "150.0"))
 # Seconds after showing point messages before /restart_session (pits)
 POINT_TO_PITS_DELAY_SEC = float(os.getenv("POINT_TO_PITS_DELAY_SEC", "3.0"))
 # After /restart_session, ignore gap-based aborts (avoids double restart at 0 km/h / bad positions)
 POST_RESTART_GAP_GRACE_SEC = float(os.getenv("BATTLE_POST_RESTART_GAP_GRACE_SEC", "15.0"))
+# After requesting /restart_session, pause battle logic briefly to avoid duplicate restarts.
+RESTART_SETTLE_SEC = float(os.getenv("BATTLE_RESTART_SETTLE_SEC", "8.0"))
 
 
 class CarState:
@@ -94,10 +96,6 @@ class BattleManager:
 
         self.battle_id = None  # DB row id of the current active battle
 
-        # DNF tracking: timestamps when each car last moved above stall speed
-        self.car1_last_moving_time = 0.0
-        self.car2_last_moving_time = 0.0
-
         # Auto-reset after FINISHED
         self.finished_time = 0.0
         self.FINISHED_COOLDOWN = 10.0  # Seconds before accepting a new battle
@@ -112,6 +110,8 @@ class BattleManager:
         self.player_names = {}
         # After session restart, skip prestart/launch gap aborts until this time (unix)
         self._gap_abort_suppressed_until = 0.0
+        # While waiting for AC to fully apply /restart_session, freeze state transitions.
+        self._restart_settle_until = 0.0
 
     def set_driver_name(self, guid, name):
         if not guid or not name or str(guid).startswith("unknown"):
@@ -146,6 +146,8 @@ class BattleManager:
             return f"[TOUGE] OVERTAKE | {board}{pit}"
         if reason == "outrun":
             return f"[TOUGE] OUTRUN | {board}{pit}"
+        if reason == "outrun_gap":
+            return f"[TOUGE] OUTRUN GAP | {board}{pit}"
         if reason == "dnf_lead_stalled":
             return f"[TOUGE] DNF lead | {board}{pit}"
         if reason == "dnf_chase_stalled":
@@ -196,8 +198,6 @@ class BattleManager:
         self.state = "IDLE"
         self.condition_start_time = 0.0
         self.launch_trigger_time = 0.0
-        self.car1_last_moving_time = 0.0
-        self.car2_last_moving_time = 0.0
         self.finished_time = 0.0
         if full_reset:
             self.battle_id = None
@@ -244,7 +244,7 @@ class BattleManager:
         # If the LEAD car's speed is dangerously slow during the ACTIVE race (e.g. less than 40 km/h) 
         # or they are going significantly slower than the CHASE car (e.g. 15 km/h delta) when the crash happens,
         # we rule it a brake-check / blocking penalty against LEAD.
-        if lead_car.speed < 40.0 or lead_car.speed < (chase_car.speed - 15.0):
+        if lead_car.speed < 40.0 or (chase_car.speed - lead_car.speed) >= BRAKE_CHECK_DELTA_KMH:
             print(f"💥 [BATTLE] BRAKE CHECK PENALTY! Lead caused crash. Impact: {impact_speed:.2f}. (Lead: {lead_car.speed:.1f} km/h, Chase: {chase_car.speed:.1f} km/h)")
             self._award_point(self.battle.chase_guid, reason='collision_brake_check')
         else:
@@ -254,6 +254,12 @@ class BattleManager:
 
     def _process_logic(self):
         now = time.time()
+
+        if self.state == "RESTARTING":
+            if now < self._restart_settle_until:
+                return
+            # Restart settle done; allow engine to arm again.
+            self.state = "IDLE"
 
         # Only consider cars that have sent telemetry in the last 5 seconds
         active_guids = [g for g, c in self.cars.items() if (now - c.last_update_time) < 5.0]
@@ -454,32 +460,12 @@ class BattleManager:
             lead_car  = self.cars[self.battle.lead_guid]
             chase_car = self.cars[self.battle.chase_guid]
 
-            # --- DNF detection: stalled car check ---
-            if lead_car.speed >= DNF_SPEED_KMH:
-                self.car1_last_moving_time = now
-            if chase_car.speed >= DNF_SPEED_KMH:
-                self.car2_last_moving_time = now
-
-            # Initialize stall timers on first active frame
-            if self.car1_last_moving_time == 0.0: self.car1_last_moving_time = now
-            if self.car2_last_moving_time == 0.0: self.car2_last_moving_time = now
-
-            lead_stalled  = (now - self.car1_last_moving_time) >= DNF_TIME_SECONDS
-            chase_stalled = (now - self.car2_last_moving_time) >= DNF_TIME_SECONDS
-
-            # Only score DNF if the opponent is still moving. When the AC session ends or both
-            # stop (pits / disconnect / loading), both speeds drop to 0 and we must not award
-            # "lead stalled" spuriously.
-            chase_still_racing = chase_car.speed >= DNF_SPEED_KMH
-            lead_still_racing = lead_car.speed >= DNF_SPEED_KMH
-
-            if lead_stalled and chase_still_racing and not TEST_MODE_1_PLAYER:
-                print(f"🚨 [BATTLE] DNF: LEAD ({self.battle.lead_guid}) stalled for {DNF_TIME_SECONDS}s. Point for CHASE!")
-                self._award_point(self.battle.chase_guid, reason='dnf_lead_stalled')
-                return
-            if chase_stalled and lead_still_racing and not TEST_MODE_1_PLAYER:
-                print(f"🚨 [BATTLE] DNF: CHASE ({self.battle.chase_guid}) stalled for {DNF_TIME_SECONDS}s. Point for LEAD!")
-                self._award_point(self.battle.lead_guid, reason='dnf_chase_stalled')
+            if distance >= OUTRUN_GAP_AUTO_POINT_METERS and not TEST_MODE_1_PLAYER:
+                print(
+                    f"🏁 [BATTLE] OUTRUN AUTO — gap {distance:.1f}m >= "
+                    f"{OUTRUN_GAP_AUTO_POINT_METERS:.1f}m. Point for LEAD!"
+                )
+                self._award_point(self.battle.lead_guid, reason='outrun_gap')
                 return
 
             # 1. OVERTAKE: Chase passes Lead cleanly
@@ -603,7 +589,6 @@ class BattleManager:
 
     def _end_run(self, is_series_end=False):
         """Returns to IDLE/FINISHED and requests a server session restart."""
-        self.state = "IDLE"
         self.condition_start_time = 0.0
         self.launch_trigger_time = 0.0
         for c in self.cars.values():
@@ -618,5 +603,7 @@ class BattleManager:
             try:
                 self.on_session_restart()
                 self._gap_abort_suppressed_until = time.time() + POST_RESTART_GAP_GRACE_SEC
+                self._restart_settle_until = time.time() + RESTART_SETTLE_SEC
+                self.state = "RESTARTING"
             except Exception as e:
                 print(f"❌ [BATTLE] Failed to request /restart_session: {e}")

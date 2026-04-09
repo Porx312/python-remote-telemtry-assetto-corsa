@@ -8,6 +8,9 @@ from network.event_dispatcher import dispatch_event, dispatch_battle_webhook, se
 
 MIN_VALID_LAP_MS = int(os.getenv("MIN_VALID_LAP_MS", "10000"))
 GHOST_DRIVER_TIMEOUT_MS = int(os.getenv("GHOST_DRIVER_TIMEOUT_MS", "90000"))
+GHOST_CARINFO_DEBOUNCE_MS = int(os.getenv("GHOST_CARINFO_DEBOUNCE_MS", "2000"))
+REGISTRATION_REFRESH_MIN_MS = int(os.getenv("REGISTRATION_REFRESH_MIN_MS", "5000"))
+CAR_UPDATE_WATCHDOG_MS = int(os.getenv("CAR_UPDATE_WATCHDOG_MS", "3000"))
 
 
 def _mark_driver_seen(driver):
@@ -68,6 +71,12 @@ def process_packet(data, server_state, addr):
     if packet_type == ACSP.NEW_SESSION:
         now_ms = int(time.time() * 1000)
         _drop_stale_drivers_on_new_session(server_state, now_ms)
+        # After AC /restart_session, some servers stop realtime feed subscriptions.
+        # Re-register to ensure packet 53 (CAR_UPDATE) resumes.
+        last_reg_ms = getattr(server_state, "last_registration_ms", 0)
+        if now_ms - last_reg_ms >= REGISTRATION_REFRESH_MIN_MS:
+            send_registration(server_state, addr[0])
+            server_state.last_registration_ms = now_ms
 
         parser.read_uint8()   # version
         parser.read_uint8()   # sessionIndex
@@ -196,6 +205,20 @@ def process_packet(data, server_state, addr):
         if is_connected == 0 or not name or not guid:
             driver = server_state.active_drivers.get(car_id)
             if driver:
+                # Debounce transient empty CAR_INFO pulses to avoid flapping remove/re-add.
+                suspects = getattr(server_state, "ghost_suspects", None)
+                if suspects is None:
+                    suspects = {}
+                    server_state.ghost_suspects = suspects
+                first_seen = suspects.get(car_id, 0)
+                now_ms = int(time.time() * 1000)
+                if not first_seen:
+                    suspects[car_id] = now_ms
+                    return
+                if now_ms - first_seen < GHOST_CARINFO_DEBOUNCE_MS:
+                    return
+                suspects.pop(car_id, None)
+
                 print(f"🧹 [{server_state.port}] Cleaning up Ghost Player: {driver.name} (CarID {car_id})")
                 
                 # Despawn Battle logic
@@ -224,6 +247,9 @@ def process_packet(data, server_state, addr):
             return
 
         if not name or not guid: return
+        suspects = getattr(server_state, "ghost_suspects", None)
+        if suspects is not None:
+            suspects.pop(car_id, None)
 
         # DO NOT wipe existing driver state (laps, penalties) on heartbeat ping
         driver = server_state.active_drivers.get(car_id)
@@ -243,6 +269,18 @@ def process_packet(data, server_state, addr):
         print(f"🏎️ [{server_state.port}] [CAR_INFO] CarID {car_id} | {name} | {model} | {guid}")
         server_state.battle_manager.set_driver_name(guid, name)
         save_driver(guid, name, model)
+
+        # If realtime stream (packet 53) drops, recover subscription proactively.
+        now_ms = int(time.time() * 1000)
+        last_car_update_ms = getattr(server_state, "last_car_update_ms", 0)
+        last_reg_ms = getattr(server_state, "last_registration_ms", 0)
+        if (
+            now_ms - last_car_update_ms >= CAR_UPDATE_WATCHDOG_MS
+            and now_ms - last_reg_ms >= REGISTRATION_REFRESH_MIN_MS
+        ):
+            send_registration(server_state, addr[0])
+            server_state.last_registration_ms = now_ms
+            print(f"🔁 [{server_state.port}] Re-subscribed realtime feed (no CAR_UPDATE detected)")
 
     # ─── CONNECTION_CLOSED (52) ─────────────────────────────
     elif packet_type == ACSP.CONNECTION_CLOSED:
@@ -296,6 +334,7 @@ def process_packet(data, server_state, addr):
         driver = server_state.active_drivers.get(car_id)
         if driver:
             _mark_driver_seen(driver)
+            server_state.last_car_update_ms = int(time.time() * 1000)
             speed_ms = ((v_x or 0)**2 + (v_y or 0)**2 + (v_z or 0)**2)**0.5
             now = int(time.time() * 1000)
             
