@@ -143,6 +143,31 @@ def _table_has_instance_id(cursor, table_name: str) -> bool:
     return has_col
 
 
+def _ensure_instance_id_column(table_name: str) -> bool:
+    """
+    Best-effort self-heal: ensure `instance_id` exists in target table.
+    Returns True if column exists after this attempt.
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            f"ALTER TABLE IF EXISTS {table_name} ADD COLUMN IF NOT EXISTS instance_id TEXT"
+        )
+        conn.commit()
+        _table_has_instance_id_cache.pop(table_name, None)
+        return _table_has_instance_id(cursor, table_name)
+    except Exception:
+        return False
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
 def init_db():
     """Crea tablas si no existen. En Supabase no se crea la base (ya existe)."""
     if not DATABASE_URL:
@@ -501,6 +526,8 @@ def get_active_server_event(server_name, event_type=None):
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         has_instance_id = _table_has_instance_id(cursor, "server_events")
         if AC_INSTANCE_ID and not has_instance_id:
+            has_instance_id = _ensure_instance_id_column("server_events")
+        if AC_INSTANCE_ID and not has_instance_id:
             # Fail-closed silently: ignore events if instance_id isolation is unavailable.
             _event_cache[cache_key] = (None, now)
             return None
@@ -578,6 +605,8 @@ def get_active_battle_config(server_name):
         conn = get_connection()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         has_instance_id = _table_has_instance_id(cursor, "server_battles")
+        if AC_INSTANCE_ID and not has_instance_id:
+            has_instance_id = _ensure_instance_id_column("server_battles")
         if AC_INSTANCE_ID and not has_instance_id:
             # Fail-closed silently: ignore battles if instance_id isolation is unavailable.
             if cache_key in _battle_cache:

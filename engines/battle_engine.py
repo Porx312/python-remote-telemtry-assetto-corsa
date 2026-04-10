@@ -101,7 +101,7 @@ class BattleManager:
         self.FINISHED_COOLDOWN = 10.0  # Seconds before accepting a new battle
 
         # Battle config
-        self.run_length_spline = 0.80   # Virtual finish line at 80% of spline
+        self.run_length_spline = 0.90   # Virtual finish line at 90% of spline
         self.judge_offset_spline = 0.03 # Draw tolerance
         self.overtake_margin_spline = 0.003 # Chase needs to be visibly ahead to pass
         self.active_start_time = 0.0

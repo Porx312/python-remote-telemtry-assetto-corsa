@@ -66,6 +66,9 @@ def process_packet(data, server_state, addr):
     packet_type = parser.read_uint8()
     if packet_type is None:
         return
+    # Keep a lightweight cache to recover driver identity by car slot when packets arrive out of order.
+    if not hasattr(server_state, "last_known_by_car_id"):
+        server_state.last_known_by_car_id = {}
 
     # ─── NEW_SESSION (50) ───────────────────────────────────
     if packet_type == ACSP.NEW_SESSION:
@@ -149,9 +152,16 @@ def process_packet(data, server_state, addr):
 
         driver = DriverInfo(name, guid, model)
         _mark_driver_seen(driver)
+        driver.car_id = car_id
         server_state.active_drivers[car_id] = driver
         if guid and not guid.startswith('unknown_'):
             server_state.guid_to_driver[guid] = driver
+            server_state.last_known_by_car_id[car_id] = {
+                "guid": guid,
+                "name": name,
+                "model": model,
+                "seen_ms": int(time.time() * 1000),
+            }
 
         print(f"🟢 [{server_state.port}] [CONNECTED] CarID {car_id} | {name} | {model} | {guid}")
         server_state.battle_manager.set_driver_name(guid, name)
@@ -219,6 +229,12 @@ def process_packet(data, server_state, addr):
                     return
                 suspects.pop(car_id, None)
 
+                # Only purge if the driver is truly stale.
+                # Empty CAR_INFO pulses can happen transiently while the player is still online.
+                last_seen = getattr(driver, "last_seen_ms", 0)
+                if last_seen > 0 and (now_ms - last_seen) <= GHOST_DRIVER_TIMEOUT_MS:
+                    return
+
                 print(f"🧹 [{server_state.port}] Cleaning up Ghost Player: {driver.name} (CarID {car_id})")
                 
                 # Despawn Battle logic
@@ -265,6 +281,12 @@ def process_packet(data, server_state, addr):
             
         if guid and not guid.startswith('unknown_'):
             server_state.guid_to_driver[guid] = driver
+            server_state.last_known_by_car_id[car_id] = {
+                "guid": guid,
+                "name": name,
+                "model": model,
+                "seen_ms": int(time.time() * 1000),
+            }
 
         print(f"🏎️ [{server_state.port}] [CAR_INFO] CarID {car_id} | {name} | {model} | {guid}")
         server_state.battle_manager.set_driver_name(guid, name)
@@ -393,12 +415,26 @@ def process_packet(data, server_state, addr):
         driver = server_state.active_drivers.get(car_id)
 
         if not driver:
-            import struct
-            driver = DriverInfo(f"Driver_CarID_{car_id}", f"unknown_{car_id}", "Unknown")
-            _mark_driver_seen(driver)
-            server_state.active_drivers[car_id] = driver
-            if server_state.last_server_addr:
-                server_state.sock.sendto(struct.pack('BB', 201, car_id), server_state.last_server_addr)
+            # Recover from recent CAR_INFO/NEW_CONNECTION cache to avoid losing laps.
+            cached = server_state.last_known_by_car_id.get(car_id)
+            if cached and cached.get("guid"):
+                driver = DriverInfo(
+                    cached.get("name") or f"Driver_CarID_{car_id}",
+                    cached["guid"],
+                    cached.get("model") or "Unknown",
+                )
+                driver.car_id = car_id
+                _mark_driver_seen(driver)
+                server_state.active_drivers[car_id] = driver
+                if not driver.guid.startswith('unknown_'):
+                    server_state.guid_to_driver[driver.guid] = driver
+            else:
+                import struct
+                # Ask AC for fresh CAR_INFO and skip this lap if identity is unknown.
+                if server_state.last_server_addr:
+                    server_state.sock.sendto(struct.pack('BB', 201, car_id), server_state.last_server_addr)
+                print(f"⚠️ [{server_state.port}] LAP_COMPLETED without driver identity (CarID {car_id}). Waiting CAR_INFO.")
+                return
         else:
             _mark_driver_seen(driver)
 
