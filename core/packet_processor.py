@@ -3,8 +3,8 @@ import os
 import re
 from network.ac_packet import ACSP, PacketParser
 from core.session_manager import DriverInfo, send_registration, send_chat, send_admin_command
-from db.database import save_driver, save_lap, get_active_server_event
-from network.event_dispatcher import dispatch_event, dispatch_battle_webhook, send_server_event
+from db.database import save_driver, save_lap, get_active_server_event, get_server_mode_for_instance
+from network.event_dispatcher import dispatch_event, send_server_event
 
 MIN_VALID_LAP_MS = int(os.getenv("MIN_VALID_LAP_MS", "10000"))
 GHOST_DRIVER_TIMEOUT_MS = int(os.getenv("GHOST_DRIVER_TIMEOUT_MS", "90000"))
@@ -17,18 +17,30 @@ def _mark_driver_seen(driver):
     driver.last_seen_ms = int(time.time() * 1000)
 
 
-def _battle_guids(battle_cfg):
-    p1 = (battle_cfg.get("player1_steam_id") or "").strip()
-    p2 = (battle_cfg.get("player2_steam_id") or "").strip()
-    return p1, p2
-
-
-def _is_battle_player(guid, battle_cfg):
-    if not guid or not battle_cfg:
-        return False
-    g = guid.strip()
-    p1, p2 = _battle_guids(battle_cfg)
-    return g == p1 or g == p2
+def _resolve_server_mode(server_state):
+    folder_id = ""
+    cfg_path = getattr(server_state, "cfg_path", "") or ""
+    if cfg_path:
+        try:
+            cfg_dir = os.path.dirname(cfg_path)
+            server_dir = os.path.dirname(cfg_dir)
+            folder_id = os.path.basename(server_dir).strip()
+        except Exception:
+            folder_id = ""
+    names = [
+        folder_id,
+        (server_state.server_name or "").strip(),
+        (getattr(server_state, "config_server_name", "") or "").strip(),
+    ]
+    seen = set()
+    for n in names:
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        mode = get_server_mode_for_instance(n)
+        if mode:
+            return mode
+    return None
 
 
 def _drop_stale_drivers_on_new_session(server_state, now_ms):
@@ -128,14 +140,16 @@ def process_packet(data, server_state, addr):
         if not event:
             event = get_active_server_event(server_state.config_server_name)
         
-        battle = server_state._get_battle()
+        server_mode = _resolve_server_mode(server_state)
+        is_battle_server = server_mode == "battle"
+        server_state.battle_manager.set_server_mode(is_battle_server)
             
         if event:
             event_info = f" | 🎮 Event: {event['event_type']}"
-        elif battle:
-            event_info = f" | ⚔️  Battle: {battle['player1_steam_id']} vs {battle['player2_steam_id']}"
+        elif server_mode:
+            event_info = f" | 🎛️  Mode: {server_mode}"
         else:
-            event_info = " | ⚠️  No Event/Battle registered"
+            event_info = " | ⚠️  No Event registered"
 
         print(f"🌍 Session [{server_state.port}]: {server_state.track} ({server_state.config}) | Name: {server_state.server_name}{event_info}")
 
@@ -173,23 +187,6 @@ def process_packet(data, server_state, addr):
         # Notify Node.js the player joined (Event webhook dropped as it's not a lap update)
         if not guid.startswith('unknown_'):
             
-            # Send battle webhook on connect so frontend knows player is alive
-            battle_cfg = server_state._get_battle()
-            if battle_cfg and _is_battle_player(guid, battle_cfg):
-                if server_state.battle_manager.battle:
-                    p1_score = server_state.battle_manager.battle.car1_score
-                    p2_score = server_state.battle_manager.battle.car2_score
-                    points_log = server_state.battle_manager.battle.points_log
-                else:
-                    p1_score, p2_score, points_log = 0, 0, []
-                dispatch_battle_webhook(server_state, battle_cfg, p1_score, p2_score, None, points_log)
-            elif battle_cfg:
-                p1, p2 = _battle_guids(battle_cfg)
-                print(
-                    f"⚠️ [{server_state.port}] [BATTLE] GUID no coincide para {name}: "
-                    f"'{guid.strip()}' vs esperados '{p1}' / '{p2}'"
-                )
-
             # Node.js General Webhook
             send_server_event("player_join", server_state.server_name, {
                 "steamId": guid,
@@ -237,17 +234,6 @@ def process_packet(data, server_state, addr):
 
                 print(f"🧹 [{server_state.port}] Cleaning up Ghost Player: {driver.name} (CarID {car_id})")
                 
-                # Despawn Battle logic
-                battle_cfg = server_state._get_battle()
-                if battle_cfg and _is_battle_player(driver.guid, battle_cfg):
-                    if server_state.battle_manager.battle:
-                        p1_score = server_state.battle_manager.battle.car1_score
-                        p2_score = server_state.battle_manager.battle.car2_score
-                        points_log = server_state.battle_manager.battle.points_log
-                    else:
-                        p1_score, p2_score, points_log = 0, 0, []
-                    dispatch_battle_webhook(server_state, battle_cfg, p1_score, p2_score, None, points_log)
-                    
                 # Node.js Event Leave
                 if not driver.guid.startswith('unknown_'):
                     send_server_event("player_leave", getattr(server_state, 'config_server_name', server_state.server_name), {
@@ -315,18 +301,9 @@ def process_packet(data, server_state, addr):
         if driver:
             print(f"👋 [{server_state.port}] Disconnected: {driver.name} (CarID {car_id})")
             if not driver.guid.startswith('unknown_'):
-                dispatch_event(server_state, driver, driver.last_lap, is_finished=True)
-                
-                battle_cfg = server_state._get_battle()
-                if battle_cfg and _is_battle_player(driver.guid, battle_cfg):
-                    if server_state.battle_manager.battle:
-                        p1_score = server_state.battle_manager.battle.car1_score
-                        p2_score = server_state.battle_manager.battle.car2_score
-                        points_log = server_state.battle_manager.battle.points_log
-                    else:
-                        p1_score, p2_score, points_log = 0, 0, []
-                    dispatch_battle_webhook(server_state, battle_cfg, p1_score, p2_score, None, points_log)
-                    
+                server_mode = _resolve_server_mode(server_state)
+                if server_mode in ("event", "time-attack"):
+                    dispatch_event(server_state, driver, driver.last_lap, is_finished=True)
                 # Node.js General Webhook
                 send_server_event("player_leave", server_state.server_name, {
                     "steamId": driver.guid,
@@ -360,16 +337,21 @@ def process_packet(data, server_state, addr):
             speed_ms = ((v_x or 0)**2 + (v_y or 0)**2 + (v_z or 0)**2)**0.5
             now = int(time.time() * 1000)
             
-            # Feed Time Attack/Endurance engine
-            event = get_active_server_event(server_state.server_name) or get_active_server_event(server_state.config_server_name)
+            server_mode = _resolve_server_mode(server_state)
+            # Feed Time Attack/Endurance engine only in event/time-attack mode.
+            event = None
+            if server_mode in ("event", "time-attack"):
+                event = get_active_server_event(server_state.server_name) or get_active_server_event(server_state.config_server_name)
             meta = event.get("metadata", {}) if event else {}
             
             driver.car_id = car_id
             server_state.event_engine.check_idle(driver, speed_ms, now, meta)
 
-            # Feed BattleManager if active
-            battle_cfg = server_state._get_battle()
-            if battle_cfg and _is_battle_player(driver.guid, battle_cfg):
+            is_battle_server = server_mode == "battle"
+            server_state.battle_manager.set_server_mode(is_battle_server)
+
+            # Feed BattleManager only on battle servers.
+            if is_battle_server:
                 server_state.battle_manager.update(
                     driver.guid, spline, speed_ms * 3.6, (pos_x, pos_y, pos_z)
                 )
@@ -385,14 +367,13 @@ def process_packet(data, server_state, addr):
             impact_speed = parser.read_float()
             driver1 = server_state.active_drivers.get(car_id)
             driver2 = server_state.active_drivers.get(other_car_id)
-            battle_cfg = server_state._get_battle()
-            if battle_cfg and driver1 and driver2:
-                if _is_battle_player(driver1.guid, battle_cfg) and _is_battle_player(
-                    driver2.guid, battle_cfg
-                ):
-                    server_state.battle_manager.handle_collision(
-                        driver1.guid, driver2.guid, impact_speed
-                    )
+            server_mode = _resolve_server_mode(server_state)
+            is_battle_server = server_mode == "battle"
+            server_state.battle_manager.set_server_mode(is_battle_server)
+            if is_battle_server and driver1 and driver2:
+                server_state.battle_manager.handle_collision(
+                    driver1.guid, driver2.guid, impact_speed
+                )
         elif ev_type == getattr(ACSP, 'CE_COLLISION_WITH_ENV', 11):
             pass # We don't track ENV collisions for battles yet
         
@@ -400,9 +381,11 @@ def process_packet(data, server_state, addr):
             driver = server_state.active_drivers.get(car_id)
             if driver:
                 driver.car_id = car_id
-                event = get_active_server_event(server_state.server_name) or get_active_server_event(server_state.config_server_name)
-                meta = event.get("metadata", {}) if event else {}
-                server_state.event_engine.check_collision(driver, meta)
+                server_mode = _resolve_server_mode(server_state)
+                if server_mode in ("event", "time-attack"):
+                    event = get_active_server_event(server_state.server_name) or get_active_server_event(server_state.config_server_name)
+                    meta = event.get("metadata", {}) if event else {}
+                    server_state.event_engine.check_collision(driver, meta)
 
     # ─── LAP_COMPLETED (58) ─────────────────────────────────
     elif packet_type == ACSP.LAP_COMPLETED:
@@ -451,10 +434,13 @@ def process_packet(data, server_state, addr):
         driver.lap_count += 1
         is_valid = (cuts == 0)
 
-        # Get active event settings to check constraints
-        event = get_active_server_event(server_state.server_name)
-        if not event:
-            event = get_active_server_event(server_state.config_server_name)
+        server_mode = _resolve_server_mode(server_state)
+        # Get active event settings to check constraints.
+        event = None
+        if server_mode in ("event", "time-attack"):
+            event = get_active_server_event(server_state.server_name)
+            if not event:
+                event = get_active_server_event(server_state.config_server_name)
 
         meta = event.get("metadata", {}) if event else {}
         total_laps = meta.get("totalLaps", "?")
@@ -466,7 +452,8 @@ def process_packet(data, server_state, addr):
             print(f"🏁 [{server_state.port}] [LAP] ⚠️  INVALID | {driver.name} | {ac_lap_time/1000:.3f}s | Cuts: {cuts} ({fail_reason})")
             
             # Send webhook to update failed lap counts in real time
-            dispatch_event(server_state, driver, lap_time_ms=0, is_finished=False)
+            if server_mode in ("event", "time-attack"):
+                dispatch_event(server_state, driver, lap_time_ms=0, is_finished=False)
             return
 
         if driver.best_lap == 0 or ac_lap_time < driver.best_lap:
@@ -490,4 +477,5 @@ def process_packet(data, server_state, addr):
             })
 
         # ── Dispatch dynamic webhook based on active event ──
-        dispatch_event(server_state, driver, lap_time_ms=ac_lap_time)
+        if server_mode in ("event", "time-attack"):
+            dispatch_event(server_state, driver, lap_time_ms=ac_lap_time)

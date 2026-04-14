@@ -20,18 +20,47 @@ if os.getenv("USE_TEST_DB", "false").lower() == "true":
     DATABASE_URL = os.getenv("TEST_DATABASE_URL") or DATABASE_URL
 
 
-def _ensure_sslmode(url: str) -> str:
-    """Supabase exige SSL; añade sslmode=require si no viene en la URL."""
+def _normalize_database_url(url: str) -> str:
+    """
+    Ajusta parámetros libpq para Supabase / Postgres remoto:
+    - sslmode (require por defecto; sobrescribible con DATABASE_SSLMODE)
+    - keepalives: reduce cortes "SSL connection has been closed unexpectedly" por idle
+    - connect_timeout: evita bloqueos largos si la red cae
+    """
     if not url:
         return url
     parsed = urlparse(url)
     if parsed.scheme not in ("postgresql", "postgres"):
         return url
     q = parse_qs(parsed.query, keep_blank_values=True)
-    low = {k.lower(): v for k, v in q.items()}
-    if "sslmode" not in low and "gssencmode" not in low:
+    keys_lower = {k.lower() for k in q.keys()}
+
+    sslmode_env = (
+        os.getenv("DATABASE_SSLMODE") or os.getenv("SUPABASE_DB_SSLMODE") or ""
+    ).strip().lower()
+    if sslmode_env in (
+        "disable",
+        "allow",
+        "prefer",
+        "require",
+        "verify-ca",
+        "verify-full",
+    ):
+        q["sslmode"] = [sslmode_env]
+    elif "sslmode" not in keys_lower and "gssencmode" not in keys_lower:
         q["sslmode"] = ["require"]
-    # parse_qs devuelve listas; urlencode las aplana
+
+    defaults = {
+        "connect_timeout": os.getenv("DATABASE_CONNECT_TIMEOUT", "15"),
+        "keepalives": "1",
+        "keepalives_idle": os.getenv("DATABASE_KEEPALIVES_IDLE", "30"),
+        "keepalives_interval": os.getenv("DATABASE_KEEPALIVES_INTERVAL", "10"),
+        "keepalives_count": os.getenv("DATABASE_KEEPALIVES_COUNT", "3"),
+    }
+    for param, val in defaults.items():
+        if param not in keys_lower:
+            q[param] = [val]
+
     flat = []
     for k, vals in q.items():
         for v in vals:
@@ -40,7 +69,7 @@ def _ensure_sslmode(url: str) -> str:
     return urlunparse(parsed._replace(query=new_query))
 
 
-DATABASE_URL = _ensure_sslmode(DATABASE_URL)
+DATABASE_URL = _normalize_database_url(DATABASE_URL)
 
 if DATABASE_URL:
     safe = urlparse(DATABASE_URL)
@@ -53,8 +82,9 @@ db_pool = None
 try:
     if DATABASE_URL:
         db_pool = pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
-except psycopg2.Error as err:
-    print(f"❌ Error al crear el pool de conexiones: {err}")
+except Exception as err:
+    print(f"[DB] Error al crear el pool de conexiones: {err}")
+    db_pool = None
 
 
 class _PooledConn:
@@ -69,8 +99,40 @@ class _PooledConn:
         return getattr(self._raw, name)
 
     def close(self):
-        if db_pool and self._raw:
-            db_pool.putconn(self._raw)
+        if not db_pool or not self._raw:
+            self._raw = None
+            return
+        raw = self._raw
+        self._raw = None
+        try:
+            db_pool.putconn(raw)
+        except Exception:
+            try:
+                db_pool.putconn(raw, close=True)
+            except Exception:
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+
+
+class _DirectConn:
+    """Conexión fuera del pool (fallback si getconn falla o no hay pool)."""
+
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+    def close(self):
+        if self._raw:
+            try:
+                self._raw.close()
+            except Exception:
+                pass
             self._raw = None
 
 
@@ -78,8 +140,11 @@ def get_connection():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL / SUPABASE_DB_URL no configurado")
     if db_pool:
-        return _PooledConn(db_pool.getconn())
-    return psycopg2.connect(DATABASE_URL)
+        try:
+            return _PooledConn(db_pool.getconn())
+        except Exception as e:
+            print(f"[DB] pool getconn failed ({e}); using direct connection")
+    return _DirectConn(psycopg2.connect(DATABASE_URL))
 
 
 # Cache: si `id` es IDENTITY en Supabase, hace falta OVERRIDING SYSTEM VALUE al insertar un id explícito.
@@ -429,6 +494,7 @@ def save_touge_battle(server_name, track, track_config, p1_guid, p2_guid, winner
 
 _event_cache = {}
 _server_active_cache = {}
+_server_mode_cache = {}
 _instance_gate_warned = False
 
 
@@ -494,6 +560,108 @@ def is_server_active_for_instance(server_name: str) -> bool:
         print(f"⚠️ Instance gate error ({name}/{AC_INSTANCE_ID}): {e}")
         _server_active_cache[cache_key] = (False, now)
         return False
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+def get_server_mode_for_instance(server_name: str) -> Optional[str]:
+    """
+    Lee el modo operativo del server desde ac_server_control.
+    Prioridad de columnas:
+      1) server_type
+      2) event_type
+    Retorna: 'battle', 'time-attack', 'event'.
+    Fallback por defecto: 'time-attack' cuando no hay modo explícito.
+    """
+    name = (server_name or "").strip()
+    if not name or not AC_INSTANCE_ID:
+        return "time-attack"
+
+    cache_key = f"{name}_{AC_INSTANCE_ID}"
+    now = time.time()
+    if cache_key in _server_mode_cache:
+        val, ts = _server_mode_cache[cache_key]
+        if now - ts < 3.0:
+            return val
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = 'ac_server_control'
+            )
+            """
+        )
+        if not bool(cursor.fetchone()[0]):
+            _server_mode_cache[cache_key] = ("time-attack", now)
+            return "time-attack"
+
+        cursor.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public'
+              AND table_name='ac_server_control'
+            """
+        )
+        available_cols = {r[0] for r in cursor.fetchall() or []}
+        if "server_type" in available_cols:
+            mode_col = "server_type"
+        elif "event_type" in available_cols:
+            mode_col = "event_type"
+        else:
+            _server_mode_cache[cache_key] = ("time-attack", now)
+            return "time-attack"
+
+        order_terms = []
+        if "updated_at" in available_cols:
+            order_terms.append("updated_at DESC NULLS LAST")
+        if "created_at" in available_cols:
+            order_terms.append("created_at DESC NULLS LAST")
+        if "id" in available_cols:
+            order_terms.append("id DESC")
+        if not order_terms:
+            # No reliable ordering columns in schema; still return first matching row.
+            order_terms.append(mode_col)
+        order_clause = ", ".join(order_terms)
+
+        cursor.execute(
+            f"""
+            SELECT {mode_col}
+            FROM ac_server_control
+            WHERE instance_id = %s
+              AND lower(btrim(server_name)) = lower(btrim(%s))
+              AND lower(COALESCE(power_state, 'stopped')) IN ('running', 'started', 'online')
+            ORDER BY {order_clause}
+            LIMIT 1
+            """,
+            (AC_INSTANCE_ID, name),
+        )
+        row = cursor.fetchone()
+        if not row:
+            _server_mode_cache[cache_key] = ("time-attack", now)
+            return "time-attack"
+
+        mode = (row[0] or "").strip().lower().replace("_", "-")
+        if mode not in {"battle", "event", "time-attack"}:
+            mode = "time-attack"
+        _server_mode_cache[cache_key] = (mode, now)
+        return mode
+    except Exception as e:
+        print(f"⚠️ Server mode lookup error ({name}/{AC_INSTANCE_ID}): {e}")
+        _server_mode_cache[cache_key] = ("time-attack", now)
+        return "time-attack"
     finally:
         if cursor:
             cursor.close()
@@ -582,78 +750,18 @@ def get_active_server_event(server_name, event_type=None):
 
 
 _battle_cache = {}
+_battle_config_deprecated_warned = False
 
 
 def get_active_battle_config(server_name):
     """
-    Retorna la configuración de la batalla activa (desde server_battles) para el server dado.
-    Cache de 3 s solo para filas encontradas; no cachea "sin batalla" para que una batalla
-    nueva en Supabase sea visible al instante.
+    Deprecated: battle mode no longer depends on `server_battles`.
+    Kept only for backward compatibility with old callers.
     """
-    now = time.time()
-    if not is_server_active_for_instance(server_name):
-        return None
-    cache_key = f"{server_name}_{AC_INSTANCE_ID or '-'}"
-    if cache_key in _battle_cache:
-        cached_result, cached_time = _battle_cache[cache_key]
-        if now - cached_time < 3.0:
-            return cached_result
-
-    conn = None
-    cursor = None
-    try:
-        conn = get_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        has_instance_id = _table_has_instance_id(cursor, "server_battles")
-        if AC_INSTANCE_ID and not has_instance_id:
-            has_instance_id = _ensure_instance_id_column("server_battles")
-        if AC_INSTANCE_ID and not has_instance_id:
-            # Fail-closed silently: ignore battles if instance_id isolation is unavailable.
-            if cache_key in _battle_cache:
-                del _battle_cache[cache_key]
-            return None
-        if AC_INSTANCE_ID and has_instance_id:
-            instance_clause = " AND instance_id = %s"
-            params = (server_name, AC_INSTANCE_ID)
-        else:
-            instance_clause = ""
-            params = (server_name,)
-        query = f"""
-            SELECT battle_id, player1_steam_id, player2_steam_id, webhook_url, webhook_secret, metadata
-            FROM server_battles
-            WHERE server_name = %s AND status = 'active'{instance_clause}
-            ORDER BY id DESC LIMIT 1
-        """
-        cursor.execute(query, params)
-        row = cursor.fetchone()
-
-        if row:
-            meta = row["metadata"] if row["metadata"] else {}
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except json.JSONDecodeError:
-                    meta = {}
-            res = {
-                "battle_id": row["battle_id"],
-                "player1_steam_id": row["player1_steam_id"],
-                "player2_steam_id": row["player2_steam_id"],
-                "webhook_url": row["webhook_url"],
-                "webhook_secret": row["webhook_secret"],
-                "metadata": meta,
-            }
-            _battle_cache[cache_key] = (res, now)
-            return res
-        if cache_key in _battle_cache:
-            del _battle_cache[cache_key]
-        return None
-    except Exception as e:
-        print(f"❌ Error getting active battle config: {e}")
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+    global _battle_config_deprecated_warned
+    if not _battle_config_deprecated_warned:
+        print("ℹ️ get_active_battle_config() deprecated: using server mode from ac_server_control.")
+        _battle_config_deprecated_warned = True
     return None
 
 

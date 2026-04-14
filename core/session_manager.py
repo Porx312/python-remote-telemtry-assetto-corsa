@@ -1,7 +1,10 @@
 import struct
 import threading
 import time
-from db.database import get_active_battle_config
+import os
+import os.path
+from uuid import uuid4
+from db.database import get_server_mode_for_instance
 from engines.battle_engine import BattleManager
 from engines.event_engine import TimeAttackEngine
 
@@ -36,6 +39,15 @@ class ServerState:
         self.config_server_name = server_name
         self.server_name = server_name
         self.cfg_path = cfg_path
+        self.server_folder_id = ""
+        if self.cfg_path:
+            try:
+                # cfg_path -> .../<server-folder>/cfg/server_cfg.ini => take parent of "cfg".
+                cfg_dir = os.path.dirname(self.cfg_path)
+                server_dir = os.path.dirname(cfg_dir)
+                self.server_folder_id = os.path.basename(server_dir).strip()
+            except Exception:
+                self.server_folder_id = ""
         
         self.active_drivers = {} # car_id -> DriverInfo
         self.guid_to_driver = {} # guid -> DriverInfo
@@ -56,33 +68,67 @@ class ServerState:
             server_state_ref=self
         )
 
-    def _get_battle(self):
-        # Nombres desde AC / ini pueden diferir en espacios; Supabase debe coincidir.
+    def _get_server_mode(self):
+        # Nombres desde AC / ini pueden diferir en espacios; panel/control debe coincidir.
         names = [
+            (self.server_folder_id or "").strip(),
             (self.server_name or "").strip(),
             (self.config_server_name or "").strip(),
-            "server",
         ]
         seen = set()
         for n in names:
             if not n or n in seen:
                 continue
             seen.add(n)
-            battle = get_active_battle_config(n)
-            if battle:
-                return battle
-        return None
+            mode = get_server_mode_for_instance(n)
+            if mode:
+                return mode
+        return ""
+
+    def _get_battle_webhook_url(self):
+        # Battle must use dedicated webhook endpoint only.
+        return (
+            (os.getenv("BATTLE_WEBHOOK_URL") or "").strip()
+            or (os.getenv("server_battle_webhook_url") or "").strip()
+        )
 
     def handle_battle_start(self, car1_guid, car2_guid):
-        config = self._get_battle()
-        if config: return config['battle_id']
-        return None
+        if self._get_server_mode() != "battle":
+            return None
+        return f"battle-{uuid4().hex[:12]}"
 
     def handle_battle_score(self, battle_id, p1_score, p2_score, winner_guid, points_log):
         from network.event_dispatcher import dispatch_battle_webhook
-        config = self._get_battle()
-        if config and config['battle_id'] == battle_id:
-            dispatch_battle_webhook(self, config, p1_score, p2_score, winner_guid, points_log)
+        webhook_url = self._get_battle_webhook_url()
+        battle = self.battle_manager.battle
+        if self._get_server_mode() != "battle" or not battle or not battle_id or not webhook_url:
+            return
+
+        p1_guid = battle.car1_guid
+        p2_guid = battle.car2_guid
+        p1_driver = self.guid_to_driver.get(p1_guid)
+        p2_driver = self.guid_to_driver.get(p2_guid)
+
+        battle_config = {
+            "battle_id": battle_id,
+            "player1_steam_id": p1_guid,
+            "player2_steam_id": p2_guid,
+            "webhook_url": webhook_url,
+            "webhook_secret": (
+                (os.getenv("BATTLE_WEBHOOK_SECRET") or "").strip()
+                or (os.getenv("battle_webhook_secret") or "").strip()
+                or None
+            ),
+            "metadata": {
+                "player1Name": getattr(p1_driver, "name", ""),
+                "player2Name": getattr(p2_driver, "name", ""),
+                "player1Car": getattr(p1_driver, "model", ""),
+                "player2Car": getattr(p2_driver, "model", ""),
+                "track": self.track,
+                "trackConfig": self.config,
+            },
+        }
+        dispatch_battle_webhook(self, battle_config, p1_score, p2_score, winner_guid, points_log)
 
     def handle_battle_restart(self):
         send_admin_command(self, "/restart_session")
