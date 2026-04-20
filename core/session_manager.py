@@ -101,6 +101,9 @@ class ServerState:
         from network.event_dispatcher import dispatch_battle_webhook
         webhook_url = self._get_battle_webhook_url()
         battle = self.battle_manager.battle
+        # Only dispatch final results (series winner decided).
+        if not winner_guid:
+            return
         if self._get_server_mode() != "battle" or not battle or not battle_id or not webhook_url:
             return
 
@@ -130,10 +133,20 @@ class ServerState:
         }
         dispatch_battle_webhook(self, battle_config, p1_score, p2_score, winner_guid, points_log)
 
-    def handle_battle_restart(self):
+    def handle_battle_restart(self, car1_guid=None, car2_guid=None):
+        # Stable/default behavior: session restart sends battle players back to pits.
         send_admin_command(self, "/restart_session")
         
     def handle_chat_message(self, guid, message):
+        # Hard guard: TOUGE battle messages are strictly private to current battle pair.
+        if message and "[TOUGE]" in message:
+            battle = self.battle_manager.battle
+            if not battle:
+                return
+            allowed = {battle.car1_guid, battle.car2_guid}
+            if guid not in allowed:
+                return
+
         driver = self.guid_to_driver.get(guid)
         if driver:
             for c_id, d in self.active_drivers.items():

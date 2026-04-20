@@ -15,7 +15,7 @@ POINTS_TO_WIN = 2
 COLLISION_MIN_IMPACT = float(os.getenv("COLLISION_MIN_IMPACT", "3.0"))
 COLLISION_MIN_REL_SPEED = float(os.getenv("COLLISION_MIN_REL_SPEED", "8.0"))
 BRAKE_CHECK_DELTA_KMH = float(os.getenv("BRAKE_CHECK_DELTA_KMH", "8.0"))
-BRAKE_CHECK_MIN_IMPACT = float(os.getenv("BRAKE_CHECK_MIN_IMPACT", "6.0"))
+BRAKE_CHECK_MIN_IMPACT = float(os.getenv("BRAKE_CHECK_MIN_IMPACT", "10"))
 BRAKE_CHECK_LOW_SPEED_KMH = float(os.getenv("BRAKE_CHECK_LOW_SPEED_KMH", "22.0"))
 MAX_BATTLE_GAP_METERS = float(os.getenv("MAX_BATTLE_GAP_METERS", "45.0"))
 # Pair lock condition: only create a 1v1 battle candidate when both are close
@@ -23,15 +23,25 @@ MAX_BATTLE_GAP_METERS = float(os.getenv("MAX_BATTLE_GAP_METERS", "45.0"))
 PAIR_LOCK_MAX_DISTANCE_METERS = float(os.getenv("PAIR_LOCK_MAX_DISTANCE_METERS", "20.0"))
 PAIR_LOCK_MIN_SPEED_KMH = float(os.getenv("PAIR_LOCK_MIN_SPEED_KMH", "35.0"))
 # If distance grows too much during ACTIVE, award lead by outrun immediately.
-OUTRUN_GAP_AUTO_POINT_METERS = float(os.getenv("OUTRUN_GAP_AUTO_POINT_METERS", "150.0"))
+OUTRUN_GAP_AUTO_POINT_METERS = float(os.getenv("OUTRUN_GAP_AUTO_POINT_METERS", "120.0"))
 # Seconds after showing point messages before /restart_session (pits)
 POINT_TO_PITS_DELAY_SEC = float(os.getenv("POINT_TO_PITS_DELAY_SEC", "3.0"))
 # After /restart_session, ignore gap-based aborts (avoids double restart at 0 km/h / bad positions)
-POST_RESTART_GAP_GRACE_SEC = float(os.getenv("BATTLE_POST_RESTART_GAP_GRACE_SEC", "15.0"))
+POST_RESTART_GAP_GRACE_SEC = float(os.getenv("BATTLE_POST_RESTART_GAP_GRACE_SEC", "25.0"))
 # After requesting /restart_session, pause battle logic briefly to avoid duplicate restarts.
 RESTART_SETTLE_SEC = float(os.getenv("BATTLE_RESTART_SETTLE_SEC", "8.0"))
 # For any awarded point, enforce visible chat before sending both to pits.
 POINT_REASON_PITS_DELAY_SEC = float(os.getenv("BATTLE_POINT_REASON_PITS_DELAY_SEC", "3.0"))
+# Keep current 1v1 pair sticky to avoid accidental re-pairing with third drivers
+# on short telemetry drops.
+PAIR_STICKY_TIMEOUT_SEC = float(os.getenv("BATTLE_PAIR_STICKY_TIMEOUT_SEC", "20.0"))
+# Minimum clear front gap to define LEAD/CHASE in run #1 (avoid side-by-side assignment).
+ROLE_ASSIGN_MIN_GAP_SPLINE = float(os.getenv("BATTLE_ROLE_ASSIGN_MIN_GAP_SPLINE", "0.0006"))
+# Max seconds to wait in LAUNCHING for a clear leader in run #1.
+ROLE_ASSIGN_WAIT_SEC = float(os.getenv("BATTLE_ROLE_ASSIGN_WAIT_SEC", "6.0"))
+# In swapped-role runs, enforce launch order for first seconds of ACTIVE.
+WRONG_POSITION_CHECK_WINDOW_SEC = float(os.getenv("BATTLE_WRONG_POSITION_CHECK_WINDOW_SEC", "3.0"))
+WRONG_POSITION_MARGIN_SPLINE = float(os.getenv("BATTLE_WRONG_POSITION_MARGIN_SPLINE", "0.0006"))
 
 
 class CarState:
@@ -112,7 +122,7 @@ class BattleManager:
         # Battle config
         self.run_length_spline = 0.90   # Virtual finish line at 90% of spline
         self.judge_offset_spline = 0.03 # Draw tolerance
-        self.overtake_margin_spline = 0.003 # Chase needs to be visibly ahead to pass
+        self.overtake_margin_spline = float(os.getenv("BATTLE_OVERTAKE_MARGIN_SPLINE", "0.005")) # Chase needs clear lead
         self.active_start_time = 0.0
         self._restart_timer = None
         # guid -> display name (from telemetry); used in scoreboard chat lines
@@ -191,7 +201,7 @@ class BattleManager:
         if reason == "outrun":
             return f"[TOUGE] OUTRUN | {board}{pit}"
         if reason == "outrun_gap":
-            return f"[TOUGE] OUTRUN GAP | {board}{pit}"
+            return f"[TOUGE] GAP {int(OUTRUN_GAP_AUTO_POINT_METERS)} | {board}{pit}"
         if reason == "dnf_lead_stalled":
             return f"[TOUGE] DNF lead | {board}{pit}"
         if reason == "dnf_chase_stalled":
@@ -330,12 +340,26 @@ class BattleManager:
             return
 
         if self.battle:
-            battle_guids = {self.battle.car1_guid, self.battle.car2_guid}
-            if not battle_guids.issubset(set(active_guids)):
+            # Never switch to a different pair while one battle is already tracked.
+            # Only cancel after a generous stale timeout (or explicit disconnect in remove_car()).
+            p1 = self.cars.get(self.battle.car1_guid)
+            p2 = self.cars.get(self.battle.car2_guid)
+            if not p1 or not p2:
                 if self.state not in ["IDLE", "FINISHED", "WAITING_RESTART"]:
-                    print("\n[BATTLE] Active pair no longer online. Resetting.")
+                    print("\n[BATTLE] Active pair missing from car state. Resetting.")
                 self._reset_to_idle(full_reset=True)
                 self.battle = None
+                return
+            p1_stale = (now - p1.last_update_time) > PAIR_STICKY_TIMEOUT_SEC
+            p2_stale = (now - p2.last_update_time) > PAIR_STICKY_TIMEOUT_SEC
+            if p1_stale or p2_stale:
+                if self.state not in ["IDLE", "FINISHED", "WAITING_RESTART"]:
+                    print("\n[BATTLE] Active pair stale timeout reached. Resetting.")
+                self._reset_to_idle(full_reset=True)
+                self.battle = None
+                return
+            # Pause logic while waiting fresh telemetry from one of the two locked drivers.
+            if self.battle.car1_guid not in active_guids or self.battle.car2_guid not in active_guids:
                 return
         else:
             pair = self._pick_candidate_pair(active_guids)
@@ -469,6 +493,19 @@ class BattleManager:
                             ],
                         )
                         return
+                else:
+                    # Run #1: do not decide roles while fully side-by-side.
+                    c1_ahead_gap = (car1.spline - car2.spline) % 1.0
+                    c2_ahead_gap = (car2.spline - car1.spline) % 1.0
+                    clear_gap = min(c1_ahead_gap, c2_ahead_gap)
+                    if clear_gap < ROLE_ASSIGN_MIN_GAP_SPLINE:
+                        if (now - self.launch_trigger_time) <= ROLE_ASSIGN_WAIT_SEC:
+                            return
+                        self._abort_run_no_point(
+                            "leader_not_clear",
+                            [f"[TOUGE] Leader not clear{self._pit_suffix()}"],
+                        )
+                        return
 
                 self.state = "ACTIVE"
                 self.battle.run_count += 1
@@ -505,10 +542,6 @@ class BattleManager:
                     self.on_chat_message(self.battle.lead_guid, "[TOUGE] LEAD")
                     self.on_chat_message(self.battle.chase_guid, "[TOUGE] CHASE")
 
-                # Emit live score webhook to notify frontend the run started
-                if self.on_score_update:
-                    self.on_score_update(self.battle_id, self.battle.car1_score, self.battle.car2_score, None, self.battle.points_log)
-
             elif now - self.launch_trigger_time > 3.0:
                 print("[BATTLE] Timeout: opponent did not reach 40 km/h within 3s. Cancelling.")
                 if self.on_chat_message:
@@ -524,14 +557,37 @@ class BattleManager:
             lead_car  = self.cars[self.battle.lead_guid]
             chase_car = self.cars[self.battle.chase_guid]
 
+            # Runs after role swap: CHASE must not be ahead right after launch.
+            if self.battle.run_count > 1 and (now - self.active_start_time) <= WRONG_POSITION_CHECK_WINDOW_SEC:
+                if chase_car.driven_spline > (lead_car.driven_spline + WRONG_POSITION_MARGIN_SPLINE):
+                    order_line = (
+                        f"L {self._display_name(self.battle.lead_guid)} / "
+                        f"C {self._display_name(self.battle.chase_guid)}"
+                    )
+                    self._abort_run_no_point(
+                        "wrong_position",
+                        [
+                            (self.battle.chase_guid, f"[TOUGE] YOU ARE NOT THE LEADER | {order_line}{self._pit_suffix()}"),
+                            (self.battle.lead_guid, f"[TOUGE] Opponent wrong position | {order_line}{self._pit_suffix()}"),
+                            f"[TOUGE] Wrong position no PT | {order_line}{self._pit_suffix()}",
+                        ],
+                    )
+                    return
+
             if distance >= OUTRUN_GAP_AUTO_POINT_METERS and not TEST_MODE_1_PLAYER:
-                # Award the auto-gap point to the car that is actually ahead *now*.
-                # This avoids wrongly giving LEAD the point if CHASE has already passed
-                # and opened a huge gap (e.g. after a fast overtake/jump scenario).
-                lead_front_gap = (lead_car.spline - chase_car.spline) % 1.0
-                lead_is_ahead = 0.0 < lead_front_gap < 0.5
-                gap_winner = self.battle.lead_guid if lead_is_ahead else self.battle.chase_guid
-                gap_winner_role = "LEAD" if lead_is_ahead else "CHASE"
+                # Use run progress (driven_spline) to avoid inverted winners on wrap/position jitter.
+                if lead_car.driven_spline > chase_car.driven_spline + 1e-6:
+                    gap_winner = self.battle.lead_guid
+                    gap_winner_role = "LEAD"
+                elif chase_car.driven_spline > lead_car.driven_spline + 1e-6:
+                    gap_winner = self.battle.chase_guid
+                    gap_winner_role = "CHASE"
+                else:
+                    # Fallback if both are almost equal (rare): use instantaneous spline relation.
+                    lead_front_gap = (lead_car.spline - chase_car.spline) % 1.0
+                    lead_is_ahead = 0.0 < lead_front_gap < 0.5
+                    gap_winner = self.battle.lead_guid if lead_is_ahead else self.battle.chase_guid
+                    gap_winner_role = "LEAD" if lead_is_ahead else "CHASE"
                 print(
                     f"🏁 [BATTLE] OUTRUN AUTO — gap {distance:.1f}m >= "
                     f"{OUTRUN_GAP_AUTO_POINT_METERS:.1f}m. Point for {gap_winner_role}!"
@@ -598,7 +654,16 @@ class BattleManager:
 
         if series_done:
             wn = self._display_name(self.battle.winner)
-            _notify_both(f"[TOUGE] WIN {wn} | {self._scoreboard_line()}")
+            if self.on_chat_message:
+                # Delay WIN line slightly so point reason (OVERTAKE / GAP) is visible first.
+                def _delayed_win():
+                    if not self.battle:
+                        return
+                    self.on_chat_message(self.battle.car1_guid, f"[TOUGE] WIN {wn} | {self._scoreboard_line()}")
+                    self.on_chat_message(self.battle.car2_guid, f"[TOUGE] WIN {wn} | {self._scoreboard_line()}")
+                t = threading.Timer(1.0, _delayed_win)
+                t.daemon = True
+                t.start()
 
         self.state = "WAITING_RESTART"
         restart_delay = max(POINT_TO_PITS_DELAY_SEC, POINT_REASON_PITS_DELAY_SEC)
@@ -622,14 +687,6 @@ class BattleManager:
                 delay_override=restart_delay,
             )
         else:
-            if self.on_score_update:
-                self.on_score_update(
-                    self.battle_id,
-                    self.battle.car1_score,
-                    self.battle.car2_score,
-                    None,
-                    self.battle.points_log,
-                )
             self._schedule_end_run(
                 is_series_end=False,
                 delay_override=restart_delay,
@@ -681,7 +738,7 @@ class BattleManager:
 
         if self.on_session_restart:
             try:
-                self.on_session_restart()
+                self.on_session_restart(self.battle.car1_guid, self.battle.car2_guid)
                 self._gap_abort_suppressed_until = time.time() + POST_RESTART_GAP_GRACE_SEC
                 self._restart_settle_until = time.time() + RESTART_SETTLE_SEC
                 self.state = "RESTARTING"

@@ -375,7 +375,7 @@ def process_packet(data, server_state, addr):
                     driver1.guid, driver2.guid, impact_speed
                 )
         elif ev_type == getattr(ACSP, 'CE_COLLISION_WITH_ENV', 11):
-            pass # We don't track ENV collisions for battles yet
+            pass
         
         if ev_type in (getattr(ACSP, 'CE_COLLISION_WITH_CAR', 10), getattr(ACSP, 'CE_COLLISION_WITH_ENV', 11)):
             driver = server_state.active_drivers.get(car_id)
