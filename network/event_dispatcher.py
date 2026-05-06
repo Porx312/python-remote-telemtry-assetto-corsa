@@ -24,6 +24,7 @@ ACAPI_KEY      = os.getenv("API_KEY", "")
 WEBHOOK_SECRET = os.getenv("EVENT_WEBHOOK_SECRET", "default_secret")
 # Node.js backend URL for general server events
 GENERAL_WEBHOOK_URL = os.getenv("SERVER_EVENT_WEBHOOK_URL")
+GENERAL_WEBHOOK_TIMEOUT_SEC = float(os.getenv("GENERAL_WEBHOOK_TIMEOUT_SEC", "5"))
 
 # ─────────────────────────────────────────────────────────────
 # General Server Event Dispatcher
@@ -52,7 +53,7 @@ def send_server_event(event_type, server_name, data):
                     "Content-Type": "application/json",
                     "x-webhook-secret": WEBHOOK_SECRET
                 },
-                timeout=5
+                timeout=GENERAL_WEBHOOK_TIMEOUT_SEC
             )
             if resp.status_code >= 400:
                 print(f"⚠️ [GENERAL-WEBHOOK] {event_type} failed with {resp.status_code}: {resp.text}")

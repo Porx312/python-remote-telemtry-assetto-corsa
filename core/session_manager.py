@@ -5,8 +5,20 @@ import os
 import os.path
 from uuid import uuid4
 from db.database import get_server_mode_for_instance
-from engines.battle_engine import BattleManager
+from engines.battlesystem.orchestrator import BattleManager
 from engines.event_engine import TimeAttackEngine
+
+def _parse_targeted_pit_commands():
+    """
+    Comandos por jugador para enviar a pits/spectator.
+    Usa placeholders: {car_id}, {steam_id}, {name}
+    Ej: "/pit {car_id};/spec {car_id}"
+    """
+    raw = (os.getenv("BATTLE_TARGETED_PIT_COMMANDS", "") or "").strip()
+    if not raw:
+        return ["/pit {car_id}"]
+    parts = [p.strip() for p in raw.replace(",", ";").split(";")]
+    return [p for p in parts if p]
 
 class DriverInfo:
     def __init__(self, name, guid, model):
@@ -97,18 +109,29 @@ class ServerState:
             return None
         return f"battle-{uuid4().hex[:12]}"
 
-    def handle_battle_score(self, battle_id, p1_score, p2_score, winner_guid, points_log):
+    def handle_battle_score(
+        self,
+        battle_id,
+        p1_score,
+        p2_score,
+        winner_guid,
+        points_log,
+        car1_guid=None,
+        car2_guid=None,
+    ):
         from network.event_dispatcher import dispatch_battle_webhook
         webhook_url = self._get_battle_webhook_url()
-        battle = self.battle_manager.battle
         # Only dispatch final results (series winner decided).
         if not winner_guid:
             return
-        if self._get_server_mode() != "battle" or not battle or not battle_id or not webhook_url:
+        if self._get_server_mode() != "battle" or not battle_id or not webhook_url:
             return
 
-        p1_guid = battle.car1_guid
-        p2_guid = battle.car2_guid
+        p1_guid = car1_guid
+        p2_guid = car2_guid
+        if not p1_guid or not p2_guid:
+            print("⚠️ [BATTLE] score update missing pair GUIDs; webhook skipped")
+            return
         p1_driver = self.guid_to_driver.get(p1_guid)
         p2_driver = self.guid_to_driver.get(p2_guid)
 
@@ -134,19 +157,70 @@ class ServerState:
         dispatch_battle_webhook(self, battle_config, p1_score, p2_score, winner_guid, points_log)
 
     def handle_battle_restart(self, car1_guid=None, car2_guid=None):
-        # Stable/default behavior: session restart sends battle players back to pits.
-        send_admin_command(self, "/restart_session")
+        use_global_restart = (
+            (os.getenv("BATTLE_USE_GLOBAL_RESTART", "false").strip().lower())
+            in ("1", "true", "yes", "on")
+        )
+        use_targeted_pit = (
+            (os.getenv("BATTLE_USE_TARGETED_PIT", "true").strip().lower())
+            in ("1", "true", "yes", "on")
+        )
+        targeted_pit_only_when_two = (
+            (os.getenv("BATTLE_TARGETED_PIT_ONLY_WHEN_SERVER_HAS_2", "true").strip().lower())
+            in ("1", "true", "yes", "on")
+        )
+
+        if use_global_restart:
+            send_admin_command(self, "/restart_session")
+            return
+
+        if not use_targeted_pit:
+            return
+
+        connected_real_drivers = sum(
+            1 for d in self.active_drivers.values()
+            if d.guid and not str(d.guid).startswith("unknown_")
+        )
+        if targeted_pit_only_when_two and connected_real_drivers > 2:
+            print(
+                "⚠️ [BATTLE] Targeted pit skipped in open server "
+                f"(connected drivers: {connected_real_drivers})."
+            )
+            return
+
+        command_templates = _parse_targeted_pit_commands()
+        cmd_delay_ms = int((os.getenv("BATTLE_TARGETED_PIT_DELAY_MS", "120") or "120").strip() or "120")
+        cmd_delay_sec = max(0, cmd_delay_ms) / 1000.0
+
+        # Open-server mode: send only this battle pair to pits/spectator.
+        targets = [car1_guid, car2_guid]
+        sent = 0
+        for guid in targets:
+            if not guid:
+                continue
+            for c_id, d in self.active_drivers.items():
+                if d.guid == guid:
+                    for template in command_templates:
+                        try:
+                            cmd = template.format(
+                                car_id=c_id,
+                                steam_id=d.guid,
+                                name=(d.name or "").strip(),
+                            )
+                        except Exception:
+                            continue
+                        if not cmd:
+                            continue
+                        send_admin_command(self, cmd)
+                        print(f"🎯 [BATTLE] targeted cmd for {d.name} ({d.guid}): {cmd}")
+                        if cmd_delay_sec > 0:
+                            time.sleep(cmd_delay_sec)
+                    sent += 1
+                    break
+        if sent:
+            print(f"🎯 [BATTLE] Sent targeted pit/spectator cmds to {sent} battle player(s)")
         
     def handle_chat_message(self, guid, message):
-        # Hard guard: TOUGE battle messages are strictly private to current battle pair.
-        if message and "[TOUGE]" in message:
-            battle = self.battle_manager.battle
-            if not battle:
-                return
-            allowed = {battle.car1_guid, battle.car2_guid}
-            if guid not in allowed:
-                return
-
         driver = self.guid_to_driver.get(guid)
         if driver:
             for c_id, d in self.active_drivers.items():
