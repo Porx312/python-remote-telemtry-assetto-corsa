@@ -4,7 +4,6 @@ import time
 from engines.battlesystem.chat import (
     format_point_broadcast,
     notify_battle_cancelled,
-    send_chat_sequence,
 )
 from engines.battlesystem.config import (
     BRAKE_CHECK_DELTA_KMH,
@@ -133,12 +132,6 @@ class PairBattleManager:
     def _format_point_broadcast(self, winner_guid, reason):
         return format_point_broadcast(self, winner_guid, reason)
 
-    def _pit_suffix(self):
-        return ""
-
-    def _send_chat_sequence(self, items):
-        send_chat_sequence(self, items)
-
     def _notify_battle_cancelled(self, reason=None):
         notify_battle_cancelled(self, reason)
 
@@ -233,8 +226,10 @@ class PairBattleManager:
     def _award_point(self, winner_guid, reason="outrun"):
         award_point(self, winner_guid, reason)
 
-    def _abort_run_no_point(self, reason, chat_sequence):
+    def _abort_run_no_point(self, reason):
+        # Silent abort: gap exceeded / false start / wrong order simply means
+        # no battle started. We do not kick, restart the session, send anyone
+        # to pits, or broadcast "BATTLE CANCELLED" in chat. We just return to
+        # IDLE so the pair can re-arm naturally.
         print(f"\n⚠️ [BATTLE] Run aborted ({reason}). No point awarded.")
-        self._send_chat_sequence(chat_sequence)
-        self._notify_battle_cancelled(reason)
         self.state = "IDLE"

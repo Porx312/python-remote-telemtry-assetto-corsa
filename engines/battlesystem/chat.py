@@ -19,18 +19,6 @@ def format_point_broadcast(manager, winner_guid, reason):
     return f"[TOUGE] PT {reason} | {board}"
 
 
-def send_chat_sequence(manager, items):
-    if not manager.on_chat_message or not items:
-        return
-    for item in items:
-        if isinstance(item, tuple) and len(item) == 2:
-            guid, msg = item
-            manager.on_chat_message(guid, msg)
-        else:
-            manager.on_chat_message(manager.battle.car1_guid, item)
-            manager.on_chat_message(manager.battle.car2_guid, item)
-
-
 def notify_battle_cancelled(manager, reason=None):
     if not manager.on_chat_message or not manager.battle:
         return

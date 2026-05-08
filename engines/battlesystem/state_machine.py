@@ -96,10 +96,7 @@ def process_pair_logic(manager):
     elif manager.state == "ARMED":
         both_moving = car1.speed >= GAP_ABORT_MIN_BOTH_SPEED_KMH and car2.speed >= GAP_ABORT_MIN_BOTH_SPEED_KMH
         if distance > MAX_BATTLE_GAP_METERS and both_moving and (now - manager.condition_start_time) >= PRESTART_GAP_ABORT_GRACE_SEC:
-            manager._abort_run_no_point(
-                f"prestart_gap_{distance:.1f}m",
-                [f"[TOUGE] GAP pre ({distance:.0f}m) no PT{manager._pit_suffix()}"],
-            )
+            manager._abort_run_no_point(f"prestart_gap_{distance:.1f}m")
             return
 
         if manager.battle_id is None and manager.on_battle_start:
@@ -124,10 +121,7 @@ def process_pair_logic(manager):
     elif manager.state == "LAUNCHING":
         both_moving = car1.speed >= GAP_ABORT_MIN_BOTH_SPEED_KMH and car2.speed >= GAP_ABORT_MIN_BOTH_SPEED_KMH
         if distance > MAX_BATTLE_GAP_METERS and both_moving and (now - manager.launch_trigger_time) >= PRESTART_GAP_ABORT_GRACE_SEC:
-            manager._abort_run_no_point(
-                f"launch_gap_{distance:.1f}m",
-                [f"[TOUGE] GAP launch ({distance:.0f}m) no PT{manager._pit_suffix()}"],
-            )
+            manager._abort_run_no_point(f"launch_gap_{distance:.1f}m")
             return
 
         if car1.speed > 40.0 and car2.speed > 40.0:
@@ -142,14 +136,7 @@ def process_pair_logic(manager):
                     nc = manager._display_name(expected_chase)
                     order_line = f"L {nl} / C {nc}"
                     print(f"🚨 [BATTLE] FALSE START | want {order_line} | chase ahead of lead")
-                    manager._abort_run_no_point(
-                        "false_start",
-                        [
-                            (expected_chase, f"[TOUGE] FS CHASE | ok: {order_line}{manager._pit_suffix()}"),
-                            (expected_lead, f"[TOUGE] FS | ok: {order_line}{manager._pit_suffix()}"),
-                            f"[TOUGE] FS order | {order_line} no PT{manager._pit_suffix()}",
-                        ],
-                    )
+                    manager._abort_run_no_point("false_start")
                     return
             else:
                 c1_ahead_gap = (car1.spline - car2.spline) % 1.0
@@ -158,7 +145,7 @@ def process_pair_logic(manager):
                 if clear_gap < ROLE_ASSIGN_MIN_GAP_SPLINE:
                     if (now - manager.launch_trigger_time) <= ROLE_ASSIGN_WAIT_SEC:
                         return
-                    manager._abort_run_no_point("leader_not_clear", [f"[TOUGE] Leader not clear{manager._pit_suffix()}"])
+                    manager._abort_run_no_point("leader_not_clear")
                     return
 
             manager.state = "ACTIVE"
@@ -211,15 +198,7 @@ def process_pair_logic(manager):
 
         if manager.battle.run_count > 1 and (now - manager.active_start_time) <= WRONG_POSITION_CHECK_WINDOW_SEC:
             if chase_car.driven_spline > (lead_car.driven_spline + WRONG_POSITION_MARGIN_SPLINE):
-                order_line = f"L {manager._display_name(manager.battle.lead_guid)} / C {manager._display_name(manager.battle.chase_guid)}"
-                manager._abort_run_no_point(
-                    "wrong_position",
-                    [
-                        (manager.battle.chase_guid, f"[TOUGE] YOU ARE NOT THE LEADER | {order_line}{manager._pit_suffix()}"),
-                        (manager.battle.lead_guid, f"[TOUGE] Opponent wrong position | {order_line}{manager._pit_suffix()}"),
-                        f"[TOUGE] Wrong position no PT | {order_line}{manager._pit_suffix()}",
-                    ],
-                )
+                manager._abort_run_no_point("wrong_position")
                 return
 
         if (now - manager.active_start_time) > 2.0 and (now - manager._last_overtake_point_ts) >= OVERTAKE_POINT_COOLDOWN_SEC:

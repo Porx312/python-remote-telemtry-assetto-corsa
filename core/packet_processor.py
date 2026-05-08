@@ -3,8 +3,8 @@ import os
 import re
 from network.ac_packet import ACSP, PacketParser
 from core.session_manager import DriverInfo, send_registration, send_chat, send_admin_command
-from db.database import save_driver, save_lap, get_active_server_event, get_server_mode_for_instance
-from network.event_dispatcher import dispatch_event, send_server_event
+from core import runtime_config
+from network.event_dispatcher import send_server_event
 
 MIN_VALID_LAP_MS = int(os.getenv("MIN_VALID_LAP_MS", "10000"))
 GHOST_DRIVER_TIMEOUT_MS = int(os.getenv("GHOST_DRIVER_TIMEOUT_MS", "90000"))
@@ -18,29 +18,7 @@ def _mark_driver_seen(driver):
 
 
 def _resolve_server_mode(server_state):
-    folder_id = ""
-    cfg_path = getattr(server_state, "cfg_path", "") or ""
-    if cfg_path:
-        try:
-            cfg_dir = os.path.dirname(cfg_path)
-            server_dir = os.path.dirname(cfg_dir)
-            folder_id = os.path.basename(server_dir).strip()
-        except Exception:
-            folder_id = ""
-    names = [
-        folder_id,
-        (server_state.server_name or "").strip(),
-        (getattr(server_state, "config_server_name", "") or "").strip(),
-    ]
-    seen = set()
-    for n in names:
-        if not n or n in seen:
-            continue
-        seen.add(n)
-        mode = get_server_mode_for_instance(n)
-        if mode:
-            return mode
-    return None
+    return runtime_config.get_mode_for_state(server_state)
 
 
 def _drop_stale_drivers_on_new_session(server_state, now_ms):
@@ -134,22 +112,14 @@ def process_packet(data, server_state, addr):
             except Exception as e:
                 print(f"❌ Error reloading {server_state.cfg_path}: {e}")
 
-        # Log active event for this server (try session name, then config name)
-        print(f"   🔍 DB Lookup: '{server_state.server_name}' or '{server_state.config_server_name}'")
-        event = get_active_server_event(server_state.server_name)
-        if not event:
-            event = get_active_server_event(server_state.config_server_name)
-        
         server_mode = _resolve_server_mode(server_state)
         is_battle_server = server_mode == "battle"
         server_state.battle_manager.set_server_mode(is_battle_server)
-            
-        if event:
-            event_info = f" | 🎮 Event: {event['event_type']}"
-        elif server_mode:
+
+        if server_mode:
             event_info = f" | 🎛️  Mode: {server_mode}"
         else:
-            event_info = " | ⚠️  No Event registered"
+            event_info = " | ⚠️  Mode unknown (waiting Redis snapshot)"
 
         print(f"🌍 Session [{server_state.port}]: {server_state.track} ({server_state.config}) | Name: {server_state.server_name}{event_info}")
 
@@ -179,7 +149,6 @@ def process_packet(data, server_state, addr):
 
         print(f"🟢 [{server_state.port}] [CONNECTED] CarID {car_id} | {name} | {model} | {guid}")
         server_state.battle_manager.set_driver_name(guid, name)
-        save_driver(guid, name, model)
 
         driver.lap_start_time = time.time() * 1000
         driver.lap_notified_fail = False
@@ -276,7 +245,6 @@ def process_packet(data, server_state, addr):
 
         print(f"🏎️ [{server_state.port}] [CAR_INFO] CarID {car_id} | {name} | {model} | {guid}")
         server_state.battle_manager.set_driver_name(guid, name)
-        save_driver(guid, name, model)
 
         # If realtime stream (packet 53) drops, recover subscription proactively.
         now_ms = int(time.time() * 1000)
@@ -301,10 +269,6 @@ def process_packet(data, server_state, addr):
         if driver:
             print(f"👋 [{server_state.port}] Disconnected: {driver.name} (CarID {car_id})")
             if not driver.guid.startswith('unknown_'):
-                server_mode = _resolve_server_mode(server_state)
-                if server_mode in ("event", "time-attack"):
-                    dispatch_event(server_state, driver, driver.last_lap, is_finished=True)
-                # Node.js General Webhook
                 send_server_event("player_leave", server_state.server_name, {
                     "steamId": driver.guid,
                     "trackName": server_state.track,
@@ -338,12 +302,10 @@ def process_packet(data, server_state, addr):
             now = int(time.time() * 1000)
             
             server_mode = _resolve_server_mode(server_state)
-            # Feed Time Attack/Endurance engine only in event/time-attack mode.
-            event = None
-            if server_mode in ("event", "time-attack"):
-                event = get_active_server_event(server_state.server_name) or get_active_server_event(server_state.config_server_name)
-            meta = event.get("metadata", {}) if event else {}
-            
+            # Without DB-backed event metadata, the time-attack engine runs
+            # purely on telemetry (no per-event constraint flags).
+            meta: dict = {}
+
             driver.car_id = car_id
             server_state.event_engine.check_idle(driver, speed_ms, now, meta)
 
@@ -383,9 +345,7 @@ def process_packet(data, server_state, addr):
                 driver.car_id = car_id
                 server_mode = _resolve_server_mode(server_state)
                 if server_mode in ("event", "time-attack"):
-                    event = get_active_server_event(server_state.server_name) or get_active_server_event(server_state.config_server_name)
-                    meta = event.get("metadata", {}) if event else {}
-                    server_state.event_engine.check_collision(driver, meta)
+                    server_state.event_engine.check_collision(driver, {})
 
     # ─── LAP_COMPLETED (58) ─────────────────────────────────
     elif packet_type == ACSP.LAP_COMPLETED:
@@ -434,48 +394,25 @@ def process_packet(data, server_state, addr):
         driver.lap_count += 1
         is_valid = (cuts == 0)
 
-        server_mode = _resolve_server_mode(server_state)
-        # Get active event settings to check constraints.
-        event = None
-        if server_mode in ("event", "time-attack"):
-            event = get_active_server_event(server_state.server_name)
-            if not event:
-                event = get_active_server_event(server_state.config_server_name)
+        meta: dict = {}
 
-        meta = event.get("metadata", {}) if event else {}
-        total_laps = meta.get("totalLaps", "?")
-        
         driver.car_id = car_id
         is_valid, fail_reason = server_state.event_engine.evaluate_lap(driver, ac_lap_time, cuts, meta)
 
         if not is_valid:
             print(f"🏁 [{server_state.port}] [LAP] ⚠️  INVALID | {driver.name} | {ac_lap_time/1000:.3f}s | Cuts: {cuts} ({fail_reason})")
-            
-            # Send webhook to update failed lap counts in real time
-            if server_mode in ("event", "time-attack"):
-                dispatch_event(server_state, driver, lap_time_ms=0, is_finished=False)
             return
 
         if driver.best_lap == 0 or ac_lap_time < driver.best_lap:
             driver.best_lap = ac_lap_time
 
         print(f"🏁 [{server_state.port}] [LAP] ✅ | {driver.name} | Lap #{driver.lap_count} | {ac_lap_time/1000:.3f}s | Best: {driver.best_lap/1000:.3f}s")
-        if event:
-            send_chat(server_state, car_id, f"[EVENT] Lap {driver.lap_count}/{total_laps} COMPLETED! Time: {ac_lap_time/1000:.3f}s")
 
         if not driver.guid.startswith('unknown_'):
-            save_lap(driver.guid, driver.model, server_state.track, server_state.config,
-                     server_state.server_name, ac_lap_time, True, now)
-            
-            # Node.js General Webhook
             send_server_event("lap_completed", server_state.server_name, {
                 "steamId": driver.guid,
                 "carModel": driver.model,
                 "trackName": server_state.track,
                 "trackConfig": server_state.config,
-                "lapTime": ac_lap_time
+                "lapTime": ac_lap_time,
             })
-
-        # ── Dispatch dynamic webhook based on active event ──
-        if server_mode in ("event", "time-attack"):
-            dispatch_event(server_state, driver, lap_time_ms=ac_lap_time)

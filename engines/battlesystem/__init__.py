@@ -1,7 +1,7 @@
 from engines.battlesystem.pair_manager import PairBattleManager
 from engines.battlesystem.orchestrator import BattleManager
 from engines.battlesystem.models import CarState, TougeBattle
-from engines.battlesystem.chat import format_point_broadcast, notify_battle_cancelled, send_chat_sequence
+from engines.battlesystem.chat import format_point_broadcast, notify_battle_cancelled
 from engines.battlesystem.scoring import (
     award_point,
     finalize_default_win,
@@ -16,7 +16,6 @@ __all__ = [
     "CarState",
     "TougeBattle",
     "format_point_broadcast",
-    "send_chat_sequence",
     "notify_battle_cancelled",
     "score_of",
     "finalize_default_win",

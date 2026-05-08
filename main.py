@@ -5,13 +5,15 @@ import time
 import os
 from dotenv import load_dotenv
 
-from db.database import init_db
+# Load .env BEFORE importing modules that read env vars at module load time
+# (event_dispatcher / redis_config_sync cache REDIS_HOST etc. on import).
+load_dotenv()
+
 from core.config_loader import load_server_configs
 from core.session_manager import ServerState, send_registration
 from core.packet_processor import process_packet
 from network.event_dispatcher import send_server_event
-
-load_dotenv()
+from core.redis_config_sync import start_redis_config_consumer
 
 SERVER_IP = '127.0.0.1'
 GHOST_DRIVER_TIMEOUT_MS = int(os.getenv("GHOST_DRIVER_TIMEOUT_MS", "90000"))
@@ -51,8 +53,8 @@ def listen_server(server_state):
 
 def server_status_loop(servers):
     """
-    Sends a "server_status" webhook every 15 seconds
-    and polls the server for CAR_INFO to clean up ghosts that dropped while loading.
+    Publishes a `server_status` event every 15 seconds and polls the AC server
+    for CAR_INFO so we can clean up ghost players that dropped while loading.
     """
     import struct
     while True:
@@ -115,8 +117,6 @@ def server_status_loop(servers):
 # ──────────────────────────────────────────────
 
 def main():
-    init_db()
-    
     # Load all server configurations into ServerState objects
     servers = load_server_configs(ServerState)
 
@@ -134,6 +134,11 @@ def main():
     sync_thread = threading.Thread(target=server_status_loop, args=(servers,), daemon=True)
     sync_thread.start()
     threads.append(sync_thread)
+
+    # Consume server configuration snapshots from Redis and apply to local AC cfg files.
+    cfg_sync_thread = threading.Thread(target=start_redis_config_consumer, args=(servers,), daemon=True)
+    cfg_sync_thread.start()
+    threads.append(cfg_sync_thread)
 
     print(f"\n✅ {len(servers)} event server(s) running. Press Ctrl+C to stop.\n")
 
