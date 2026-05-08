@@ -36,7 +36,7 @@ REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 REDIS_SSL = os.getenv("REDIS_SSL", "false").strip().lower() == "true"
 REDIS_STREAM_KEY = os.getenv("REDIS_STREAM_KEY", "ac:events")
-REDIS_STREAM_MAXLEN = int(os.getenv("REDIS_STREAM_MAXLEN", "200000"))
+REDIS_STREAM_MAXLEN = int(os.getenv("REDIS_STREAM_MAXLEN", "20000"))
 REDIS_SCHEMA_VERSION = os.getenv("REDIS_SCHEMA_VERSION", "1")
 
 _redis_client = None

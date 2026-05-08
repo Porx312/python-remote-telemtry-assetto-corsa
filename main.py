@@ -18,6 +18,18 @@ from core.redis_config_sync import start_redis_config_consumer
 SERVER_IP = '127.0.0.1'
 GHOST_DRIVER_TIMEOUT_MS = int(os.getenv("GHOST_DRIVER_TIMEOUT_MS", "90000"))
 
+# Local UDP polling cadence to detect ghost drivers; cheap, no network egress.
+SERVER_STATUS_POLL_INTERVAL_SEC = int(os.getenv("SERVER_STATUS_POLL_INTERVAL_SEC", "15"))
+# Cadence used when the server state actually changed (player joined/left,
+# track/config swap). Keep small so the dashboard reacts fast.
+SERVER_STATUS_PUBLISH_INTERVAL_SEC = int(os.getenv("SERVER_STATUS_PUBLISH_INTERVAL_SEC", "30"))
+# Force a "still alive" publish even when nothing changed, so Convex can mark
+# the server offline if heartbeats stop arriving.
+SERVER_STATUS_HEARTBEAT_INTERVAL_SEC = int(os.getenv("SERVER_STATUS_HEARTBEAT_INTERVAL_SEC", "300"))
+SERVER_STATUS_ON_CHANGE_ONLY = os.getenv("SERVER_STATUS_ON_CHANGE_ONLY", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 # ──────────────────────────────────────────────
 # SERVER LISTENER THREAD
 # ──────────────────────────────────────────────
@@ -51,19 +63,37 @@ def listen_server(server_state):
 # SERVER STATUS SYNC THREAD
 # ──────────────────────────────────────────────
 
+def _build_server_status_signature(players, track, config):
+    """Stable signature so we can compare two server snapshots cheaply."""
+    sorted_players = sorted(
+        ({"steamId": p.get("steamId"), "carModel": p.get("carModel")} for p in players),
+        key=lambda x: (x.get("steamId") or "", x.get("carModel") or ""),
+    )
+    return (track or "", config or "", tuple((p["steamId"], p["carModel"]) for p in sorted_players))
+
+
 def server_status_loop(servers):
     """
-    Publishes a `server_status` event every 15 seconds and polls the AC server
-    for CAR_INFO so we can clean up ghost players that dropped while loading.
+    Polls the AC server every SERVER_STATUS_POLL_INTERVAL_SEC for CAR_INFO so
+    we can detect ghost players (cheap local UDP, no Redis cost).
+
+    Publishing the resulting `server_status` event to Redis is decoupled from
+    that polling cadence:
+      * If the snapshot changed (players joined/left, track/config swap) and
+        at least SERVER_STATUS_PUBLISH_INTERVAL_SEC seconds passed, publish.
+      * Otherwise force a heartbeat every SERVER_STATUS_HEARTBEAT_INTERVAL_SEC
+        seconds so Convex can detect a dead worker.
     """
     import struct
+    last_signatures: dict[int, tuple] = {}
+    last_publish_at: dict[int, float] = {}
     while True:
-        # Sleep first so we don't spam instantly on boot
-        time.sleep(15)
+        time.sleep(max(1, SERVER_STATUS_POLL_INTERVAL_SEC))
+        now = time.time()
         for state in servers.values():
             if not state.last_server_addr:
-                continue # Never got a packet from this server yet
-            
+                continue  # Never got a packet from this server yet
+
             # Ping AC server for all slots to detect silent disconnects
             for i in range(32):
                 packet = struct.pack('BB', 201, i)
@@ -105,12 +135,33 @@ def server_status_loop(servers):
                     })
             if stale_car_ids:
                 print(f"🧹 [{state.port}] Purga estado: {len(stale_car_ids)} ghost(s) removidos por timeout")
-            
+
+            signature = _build_server_status_signature(players, state.track, state.config)
+            previous_sig = last_signatures.get(state.port)
+            previous_publish = last_publish_at.get(state.port, 0.0)
+            elapsed = now - previous_publish
+            heartbeat_due = elapsed >= SERVER_STATUS_HEARTBEAT_INTERVAL_SEC
+            change_due = (
+                signature != previous_sig
+                and elapsed >= SERVER_STATUS_PUBLISH_INTERVAL_SEC
+            )
+
+            if not SERVER_STATUS_ON_CHANGE_ONLY:
+                # Legacy mode: publish every poll tick.
+                should_publish = True
+            else:
+                should_publish = previous_sig is None or change_due or heartbeat_due
+
+            if not should_publish:
+                continue
+
             send_server_event("server_status", getattr(state, 'config_server_name', state.server_name), {
                 "players": players,
                 "trackName": state.track,
                 "trackConfig": state.config
             })
+            last_signatures[state.port] = signature
+            last_publish_at[state.port] = now
 
 # ──────────────────────────────────────────────
 # MAIN
